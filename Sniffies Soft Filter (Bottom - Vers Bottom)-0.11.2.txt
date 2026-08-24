@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.11.1
-// @last-change  2026-08-23 00:00:00 EDT
+// @version      0.11.2
+// @last-change  2026-08-24 00:00:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
 // @grant        GM_openInTab
@@ -99,8 +99,9 @@ ARCHITECTURE OVERVIEW
 
 3) Decision engine:
    applyHiding() executes hide/show/highlight logic in deterministic order:
-   blocked -> text exclude -> recent-chat hide -> any-chat hide ->
-   missing-chat-history hide -> not-online hide -> attitude rules -> highlights.
+   blocked -> text exclude -> recent-chat-24h hide -> recent-chat-2h hide ->
+   any-chat hide -> missing-chat-history hide -> not-online hide ->
+   repeated-delete hide -> unanswered-out hide -> attitude rules -> highlights.
 
 4) Interaction capture:
    installChatCapture() patches fetch/XHR/WebSocket payload paths to detect
@@ -1643,6 +1644,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   let pendingRefreshTimer = 0;
   let updatePartialsBusy = false;
   let updatePartialsQueued = false;
+  let gdriveSyncBusy = false;
+  let gdriveSyncQueued = false;
   let profileExcludeTerms = [];
   let profileIncludeTerms = [];
   let chatSaveTimer = 0;
@@ -1653,7 +1656,6 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   const autoMessageTabHandles = /* @__PURE__ */ new Map();
   let profileContainerObserver = null;
   let globalChatHideObserver = null;
-  let globalChatHideTimer = 0;
   let profileContainerCheckTimer = 0;
   let profileRefreshTimer = 0;
   let bookmarkSaveTimer = 0;
@@ -1956,10 +1958,18 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     prompt(promptTitle, value);
     return false;
   }
-  // Assign value onto window, globalThis, and unsafeWindow (Tampermonkey page realm).
-  // Each target/assignment is try-wrapped and deduped; used to publish __sniffies* debug globals.
-  function exposeGlobal(name, value) {
+  // Assign value onto window and globalThis (the userscript sandbox realm), and — unless
+  // opts.sandboxOnly is set — also onto unsafeWindow (Tampermonkey PAGE realm) so read-only debug
+  // globals are reachable from the page's own console without switching DevTools context.
+  // sandboxOnly:true is required for anything that mutates state, triggers network calls, or exposes
+  // private data (bookmarks/appointments/etc.) — the README/CLAUDE.md documents "avoids page-context
+  // injection... keep work in the userscript sandbox", so a global reachable from the page's own JS
+  // realm (a future sniffies.com XSS, or another extension/userscript sharing that page) must not be
+  // able to read private data or invoke privileged actions with zero origin check.
+  // Each target/assignment is try-wrapped and deduped.
+  function exposeGlobal(name, value, opts) {
     if (shouldLog("verbose")) log("→ exposeGlobal", traceArgs(arguments));
+    const sandboxOnly = !!(opts && opts.sandboxOnly);
     const targets = [];
     try {
       targets.push(window);
@@ -1969,10 +1979,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       targets.push(globalThis);
     } catch (e) {
     }
-    try {
-      // Also expose onto unsafeWindow so debug globals are reachable from the page's own console realm.
-      if (typeof unsafeWindow !== "undefined" && unsafeWindow) targets.push(unsafeWindow);
-    } catch (e) {
+    if (!sandboxOnly) {
+      try {
+        // Also expose onto unsafeWindow so read-only debug globals are reachable from the page's own console realm.
+        if (typeof unsafeWindow !== "undefined" && unsafeWindow) targets.push(unsafeWindow);
+      } catch (e) {
+      }
     }
     const seen = /* @__PURE__ */ new Set();
     for (const t of targets) {
@@ -4732,7 +4744,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     return id || fallbackId;
   }
   // From a conversation-summary object, parses last-sent/last-received/last-any timestamps by key pattern and upserts them as chat activity for the peer.
-  // If only an 'any' time is present, applies it to both directions. Returns whether activity changed.
+  // If only an 'any' time is present, it updates anyLastTs only (not myLastTs/theirLastTs — see the inline
+  // comment below). Returns whether activity changed.
   function ingestSummaryTimes(obj, contextProfileId) {
     const profileId = findLikelyProfileId(obj, contextProfileId);
     if (!profileId) return false;
@@ -4757,7 +4770,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     return upsertChatActivity(profileId, myTs, theirTs, anyTs);
   }
   // Ingests a single message event: derives direction (flags, then self/context id match), upserts chat activity, and stores a preview snippet.
-  // Learns the viewer's own id from out/in inference (rememberSelfProfileId); unresolved direction records both-sided activity. Returns whether anything changed.
+  // Learns the viewer's own id from out/in inference (rememberSelfProfileId); unresolved direction records
+  // activity in the any-only channel (not both-sided — see the inline comment below). Returns whether anything changed.
   function ingestMessageTime(obj, contextProfileId) {
     if (!obj || typeof obj !== "object") return false;
     const ts = extractEventTimestamp(obj);
@@ -5169,7 +5183,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function parseWsPayloadText(text) {
     if (shouldLog("verbose")) log("→ parseWsPayloadText", traceArgs(arguments));
     if (!text || typeof text !== "string") return null;
-    // Cap oversized frames before parsing (mirrors the XHR text path's 1.5MB guard at ~line 5234) so a
+    // Cap oversized frames before parsing (mirrors the XHR text path's 1.5MB guard in patchChatCaptureOnWindow) so a
     // pathologically large socket frame can't cause a synchronous JSON.parse jank / memory spike.
     if (text.length > 15e5) return null;
     const trimmed = text.trim();
@@ -5274,6 +5288,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         patched = true;
       }
     } catch (e) {
+      // Real failure mode: a hardened/frozen fetch (e.g. under stricter SES lockdown) throwing on
+      // reassignment. Logged so a blocked patch is distinguishable from a successful one, instead of
+      // silently leaving chat capture non-functional on this realm.
+      log(`patchChatCaptureOnWindow(${label}): fetch patch failed`, e);
     }
     try {
       const ResponseCtor = targetWindow.Response;
@@ -5303,6 +5321,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         }
       }
     } catch (e) {
+      log(`patchChatCaptureOnWindow(${label}): Response.prototype.json patch failed`, e);
     }
     try {
       const XHR = targetWindow.XMLHttpRequest;
@@ -5343,6 +5362,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         patched = true;
       }
     } catch (e) {
+      log(`patchChatCaptureOnWindow(${label}): XMLHttpRequest patch failed`, e);
     }
     try {
       const NativeWebSocket = targetWindow.WebSocket;
@@ -5385,8 +5405,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         }
       }
     } catch (e) {
+      log(`patchChatCaptureOnWindow(${label}): WebSocket patch failed`, e);
     }
     if (patched) logInfo(`Chat capture patched on ${label}`);
+    else logWarn(`patchChatCaptureOnWindow(${label}): no capture hook installed (fetch/Response.json/XHR/WebSocket all unpatched) — chat-activity capture will not work on this realm`);
     return patched;
   }
   // Entry point: patch chat capture on both the userscript sandbox window and (if exposed) unsafeWindow, then do a forced storage scan.
@@ -6021,7 +6043,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           body: JSON.stringify({ userId: id }),
           credentials: "include"
         });
-        // HTTP 429 -> record the rate-limit hit and stop probing further bases/payloads (also at fetchPartials ~5102).
+        // HTTP 429 -> record the rate-limit hit and stop probing further bases/payloads (also handled in fetchPartials).
         if (res.status === 429) {
           noteRateLimit();
           return null;
@@ -6212,8 +6234,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       }
     }
     for (const container of markerContainers) {
-      if (allMarkers.has(getMarkerIdFromElement(container))) continue;
       let id = getMarkerIdFromElement(container);
+      if (id && allMarkers.has(id)) continue;
       if (!id) {
         const link = container.querySelector("a[href*='/profile/']");
         if (link) {
@@ -6223,8 +6245,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         }
       }
       if (!id) {
-        const rect = container.getBoundingClientRect();
-        id = getIdFromMapAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        // Throttled fallback (per-marker cooldown via markerAttemptTs) — matches the markerImages loop
+        // above, so a container that can't resolve via link/data-attr doesn't re-run the costly
+        // map.queryRenderedFeatures hit-test on every scan cycle.
+        id = tryIdFromMapForMarker(container);
       }
       if (id) {
         allMarkers.set(id, container);
@@ -6253,7 +6277,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     return { markerCount: markerImages.length + markerContainers.length, ids };
   }
   // Core decision engine: rescans markers, then for each runs hide/show/highlight in a FIXED order (do not reorder).
-  // Hide gates in sequence: blocked -> profile-terms -> recent-chats -> any-chats -> missing-chat-history -> offline-2h -> attitude.
+  // Hide gates in sequence: blocked -> profile-terms -> recent-chats-24h -> recent-chats-2h -> any-chats
+  // -> missing-chat-history -> offline-2h -> repeated-delete -> unanswered-out -> attitude.
   // Otherwise shows the marker, applies text/attitude highlights, updates its chat badge; refreshes match panel and filter launchers.
   function applyHiding(alreadyScanned) {
     if (shouldLog("verbose")) log("→ applyHiding", traceArgs(arguments));
@@ -6270,8 +6295,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         unhighlightMarker(marker);
         showMarker(marker);
       }
+      // renderMatchPanel() already calls updateTextFilterMatchCounts() internally.
       renderMatchPanel();
-      updateTextFilterMatchCounts();
       updateRecentChatFilterLauncher();
       updateAnyChatFilterLauncher();
       updateNotOnlineFilterLauncher();
@@ -6356,8 +6381,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     // Second pass: badge positioning reads layout (getComputedStyle/getBoundingClientRect); running it after all
     // hide/show class writes above prevents per-marker read-write layout thrash on this hot path (~2s interval).
     for (const [id, marker] of pendingBadgeUpdates) updateMarkerChatBadge(id, marker);
+    // renderMatchPanel() already calls updateTextFilterMatchCounts() internally.
     renderMatchPanel();
-    updateTextFilterMatchCounts();
     updateRecentChatFilterLauncher();
     updateAnyChatFilterLauncher();
     updateNotOnlineFilterLauncher();
@@ -6448,20 +6473,27 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (!msgEl) return null;
     return normalizeProfileId(msgEl.id || (msgEl.getAttribute && msgEl.getAttribute("id")));
   }
-  // Sweep every global-chat message and toggle the hide class by author. Idempotent: re-shows a
-  // message when its author is no longer filtered. No-op when no global-chat messages are present.
-  function applyGlobalChatHiding() {
-    if (shouldLog("verbose")) log("→ applyGlobalChatHiding", traceArgs(arguments));
-    const msgs = document.querySelectorAll('[data-testid="globalChat-message"]');
-    if (!msgs.length) return;
+  // Toggle the hide class by author for exactly the given message elements. Shared by the full sweep
+  // (applyGlobalChatHiding) and the mutation-observer's targeted per-added-node sweep below.
+  function applyGlobalChatHidingToMessages(msgs) {
     for (const el of msgs) {
       const target = (el.closest && el.closest('[data-testid="global-chat-message-container"]')) || el;
       target.classList.toggle("sniffies-gc-hide", globalChatMessageHidden(el));
     }
   }
-  // Lazily attach a MutationObserver to the global-chat list so streamed messages hide instantly
-  // (the 2s apply loop is the backstop). Re-attaches if the list element is replaced on navigation;
-  // disconnects when the list is gone. Debounced 80ms.
+  // Sweep every global-chat message and toggle the hide class by author. Idempotent: re-shows a
+  // message when its author is no longer filtered. No-op when no global-chat messages are present.
+  // This is the O(n) correctness backstop, called from the 2s applyHiding() loop (catches an author's
+  // filter state changing with no new message arriving) — NOT from the mutation observer, which does
+  // its own targeted sweep instead (see ensureGlobalChatHideObserver).
+  function applyGlobalChatHiding() {
+    if (shouldLog("verbose")) log("→ applyGlobalChatHiding", traceArgs(arguments));
+    const msgs = document.querySelectorAll('[data-testid="globalChat-message"]');
+    if (!msgs.length) return;
+    applyGlobalChatHidingToMessages(msgs);
+  }
+  // Lazily attach a MutationObserver to the global-chat list so streamed messages hide instantly.
+  // Re-attaches if the list element is replaced on navigation; disconnects when the list is gone.
   function ensureGlobalChatHideObserver() {
     if (shouldLog("verbose")) log("→ ensureGlobalChatHideObserver", traceArgs(arguments));
     const list = document.querySelector('[data-testid="global-chat-list-container"]');
@@ -6471,9 +6503,22 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     if (globalChatHideObserver && globalChatHideObserver.__target === list && document.body.contains(list)) return;
     if (globalChatHideObserver) { try { globalChatHideObserver.disconnect(); } catch (e) {} }
-    globalChatHideObserver = new MutationObserver(() => {
-      if (globalChatHideTimer) return;
-      globalChatHideTimer = setTimeout(() => { globalChatHideTimer = 0; applyGlobalChatHiding(); }, 80);
+    globalChatHideObserver = new MutationObserver((mutations) => {
+      // Sweep only the newly-added message nodes instead of re-querying/re-evaluating the whole list —
+      // the list only grows monotonically as the room streams messages, and the 2s applyHiding() loop
+      // already provides the full-list correctness backstop (e.g. a filter changing with no new
+      // message), so there is nothing left for a debounced full re-sweep here to catch.
+      const added = /* @__PURE__ */ new Set();
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          if (node.matches && node.matches('[data-testid="globalChat-message"]')) added.add(node);
+          if (node.querySelectorAll) {
+            for (const el of node.querySelectorAll('[data-testid="globalChat-message"]')) added.add(el);
+          }
+        }
+      }
+      if (added.size) applyGlobalChatHidingToMessages(added);
     });
     globalChatHideObserver.observe(list, { childList: true, subtree: true });
     globalChatHideObserver.__target = list;
@@ -7397,6 +7442,15 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // On a chat page opened with the sf_automsg param, auto-send the queued pending phrase for that profile.
   // Bails (clearing URL params) if no pending, pending too old (>10 min), already in cooldown, or empty phrase.
+  // Delete the auto-message queuing/tracking URL params and replace the current history entry.
+  // Shared by every exit path of maybeAutoSendPendingMessageFromUrl so they can't drift out of sync.
+  function clearAutoMessageUrlParams(url) {
+    url.searchParams.delete(AUTO_MESSAGE_URL_PARAM);
+    url.searchParams.delete("sf_msg_ts");
+    url.searchParams.delete(AUTO_MESSAGE_TOKEN_PARAM);
+    url.searchParams.delete(AUTO_MESSAGE_AUTOCLOSE_PARAM);
+    history.replaceState({}, "", url.toString());
+  }
   function maybeAutoSendPendingMessageFromUrl() {
     if (shouldLog("verbose")) log("→ maybeAutoSendPendingMessageFromUrl", traceArgs(arguments));
     let url;
@@ -7412,45 +7466,40 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (!profileId) return;
     const pending = readPendingAutoMessage(profileId);
     if (!pending) {
-      url.searchParams.delete(AUTO_MESSAGE_URL_PARAM);
-      url.searchParams.delete("sf_msg_ts");
-      url.searchParams.delete(AUTO_MESSAGE_TOKEN_PARAM);
-      url.searchParams.delete(AUTO_MESSAGE_AUTOCLOSE_PARAM);
-      history.replaceState({}, "", url.toString());
+      clearAutoMessageUrlParams(url);
       return;
     }
     // Discards a queued auto-message older than 10 minutes instead of sending it.
     if (now() - (parseTimestamp(pending.ts) || 0) > AUTO_MESSAGE_PENDING_MAX_AGE_MS) {
       consumePendingAutoMessage(profileId);
-      url.searchParams.delete(AUTO_MESSAGE_URL_PARAM);
-      url.searchParams.delete("sf_msg_ts");
-      url.searchParams.delete(AUTO_MESSAGE_TOKEN_PARAM);
-      url.searchParams.delete(AUTO_MESSAGE_AUTOCLOSE_PARAM);
-      history.replaceState({}, "", url.toString());
+      clearAutoMessageUrlParams(url);
       return;
     }
     if (recentAutoMessageSent(profileId)) {
       consumePendingAutoMessage(profileId);
-      url.searchParams.delete(AUTO_MESSAGE_URL_PARAM);
-      url.searchParams.delete("sf_msg_ts");
-      url.searchParams.delete(AUTO_MESSAGE_TOKEN_PARAM);
-      url.searchParams.delete(AUTO_MESSAGE_AUTOCLOSE_PARAM);
-      history.replaceState({}, "", url.toString());
+      clearAutoMessageUrlParams(url);
       return;
     }
     const phrase = String(pending.phrase || "").trim();
     if (!phrase) {
       consumePendingAutoMessage(profileId);
-      url.searchParams.delete(AUTO_MESSAGE_URL_PARAM);
-      url.searchParams.delete("sf_msg_ts");
-      url.searchParams.delete(AUTO_MESSAGE_TOKEN_PARAM);
-      url.searchParams.delete(AUTO_MESSAGE_AUTOCLOSE_PARAM);
-      history.replaceState({}, "", url.toString());
+      clearAutoMessageUrlParams(url);
       return;
     }
     let attempts = 0;
     const timer = setInterval(() => {
       attempts += 1;
+      // The SPA can navigate to a different chat while this poller is waiting for the composer to
+      // mount (up to ~12s) — re-verify we're still on the target profile's chat before each attempt so
+      // a late-arriving composer never receives a message queued for someone else's conversation.
+      if (getChatContextProfileId() !== profileId) {
+        if (attempts >= AUTO_MESSAGE_AUTOSEND_ATTEMPTS) {
+          clearInterval(timer);
+          consumePendingAutoMessage(profileId);
+          setStatus(`Auto-send failed: navigated away (${profileId.slice(0, 8)})`);
+        }
+        return;
+      }
       const input = findChatInputElement();
       if (!input) {
         if (attempts >= AUTO_MESSAGE_AUTOSEND_ATTEMPTS) {
@@ -7485,11 +7534,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       });
       setStatus(`Message sent: ${profileId.slice(0, 8)}`);
       clearInterval(timer);
-      url.searchParams.delete(AUTO_MESSAGE_URL_PARAM);
-      url.searchParams.delete("sf_msg_ts");
-      url.searchParams.delete(AUTO_MESSAGE_TOKEN_PARAM);
-      url.searchParams.delete(AUTO_MESSAGE_AUTOCLOSE_PARAM);
-      history.replaceState({}, "", url.toString());
+      clearAutoMessageUrlParams(url);
       if (shouldAutoClose) maybeCloseAutoMessageTab();
     // Polls for the composer every 500ms, up to 24 attempts (~12s) before giving up.
     }, AUTO_MESSAGE_AUTOSEND_INTERVAL_MS);
@@ -7711,8 +7756,15 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       ids = input.split(/[\s,]+/).filter(Boolean);
     }
     const normalized = normalizeIdList(ids);
-    for (const id of normalized) blocked.add(id);
+    const importedAt = now();
+    for (const id of normalized) {
+      blocked.add(id);
+      // Backfill blockedAt (see loadNotesFromGDrive) so a stale pre-existing reply can't immediately
+      // auto-unhide a profile blocked via this import.
+      if (!blockedAt.has(id)) blockedAt.set(id, importedAt);
+    }
     saveBlockedSet();
+    saveBlockedAtMap();
     applyHiding();
     alert(`Imported ${normalized.length} IDs (merged).`);
   }
@@ -7772,8 +7824,18 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         }
       }
       if (data.blocked && Array.isArray(data.blocked)) {
-        for (const id of data.blocked) blocked.add(id);
+        // Normalize like importBlocked()/loadNotesFromGDrive() do — otherwise a malformed/non-string
+        // entry from a pasted export could land in `blocked`, which every other call site assumes
+        // contains only normalized hex-id strings.
+        const importedAt = now();
+        for (const id of normalizeIdList(data.blocked)) {
+          blocked.add(id);
+          // Backfill blockedAt (see loadNotesFromGDrive) so a stale pre-existing reply can't
+          // immediately auto-unhide a profile blocked via this import.
+          if (!blockedAt.has(id)) blockedAt.set(id, importedAt);
+        }
         saveBlockedSet();
+        saveBlockedAtMap();
       }
       if (data.notes && typeof data.notes === "object") {
         // Object.entries (own enumerable keys only) avoids importing inherited/prototype-polluted keys; normalize
@@ -7851,8 +7913,13 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       }
       if (data.phraseStats && typeof data.phraseStats === "object") {
         // Merge per-key (don't replace wholesale); skip non-object rows so a malformed export can't poison the map.
+        // Unlike phraseHistory/notes/ratings above, this key is arbitrary phrase text, not a profile id run
+        // through normalizeProfileId — so it isn't otherwise filtered, and phraseStats[key] = row is a bracket
+        // assignment ([[Set]] semantics): a key literally named "__proto__" would reassign phraseStats' own
+        // prototype to the attacker-controlled row object. Reject the dangerous key names explicitly.
         for (const [key, row] of Object.entries(data.phraseStats)) {
-          if (!key || !row || typeof row !== "object") continue;
+          if (!key || key === "__proto__" || key === "constructor" || key === "prototype") continue;
+          if (!row || typeof row !== "object") continue;
           phraseStats[key] = row;
         }
         savePhraseStats();
@@ -8271,8 +8338,29 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Upload notes/ratings/blocked/bookmarks to Drive, authenticating first if needed; PATCHes the existing fileId or multipart-POSTs a new file (saving its id).
   // 401 clears the token and marks disconnected; other failures mark error. Updates the sync-status badge throughout.
+  // Reentrancy-coalesced via busy/queued flags (mirrors updatePartials' pattern): a call that arrives
+  // while a sync is in flight is replayed exactly once after the current run finishes, instead of
+  // running concurrently. Without this, the debounced auto-sync timer and the manual "Sync" button can
+  // both reach the "no fileId yet, create a new file" branch at once; the second response to resolve
+  // silently overwrites the stored file id, orphaning whichever Drive file isn't referenced afterward.
   async function syncNotesToGDrive() {
     if (shouldLog("verbose")) log("→ syncNotesToGDrive", traceArgs(arguments));
+    if (gdriveSyncBusy) {
+      gdriveSyncQueued = true;
+      return;
+    }
+    gdriveSyncBusy = true;
+    try {
+      await syncNotesToGDriveNow();
+    } finally {
+      gdriveSyncBusy = false;
+      if (gdriveSyncQueued) {
+        gdriveSyncQueued = false;
+        queueMicrotask(() => syncNotesToGDrive());
+      }
+    }
+  }
+  async function syncNotesToGDriveNow() {
     if (!isGDriveOAuthConfigured()) {
       updateSyncStatus("disconnected");
       alert("Google Drive sync is disabled. Configure GOOGLE_CLIENT_ID first.");
@@ -8409,8 +8497,16 @@ ${JSON.stringify(fileContent)}\r
           logInfo("Loaded ratings from Google Drive");
         }
         if (data.blocked && Array.isArray(data.blocked)) {
-          blocked = new Set(data.blocked);
+          blocked = new Set(normalizeIdList(data.blocked));
+          // Backfill blockedAt for any id newly present via this full-overwrite Drive sync that wasn't
+          // already tracked — loadBlockedAtMap()'s documented anti-race protection (a stale pre-existing
+          // reply can't immediately auto-unhide a profile) only works if every blocked id has a timestamp.
+          const syncedAt = now();
+          for (const id of blocked) {
+            if (!blockedAt.has(id)) blockedAt.set(id, syncedAt);
+          }
           saveBlockedSet();
+          saveBlockedAtMap();
           logInfo("Loaded blocked list from Google Drive");
         }
         if (data.bookmarks) {
@@ -8796,7 +8892,8 @@ ${JSON.stringify(fileContent)}\r
     return "";
   }
   // Compute a profile's effective attitude plus the single highest-priority reason it would be hidden (a 0-or-1 element array).
-  // else-if chain checks in priority order (blocked > text > recent-chat > any-chat > missing-history > attitude); visibleOnMap is true only when none apply.
+  // else-if chain checks in priority order (blocked > text > recent-chat-24h > recent-chat-2h > any-chat >
+  // missing-history > not-online > repeated-delete > unanswered-out > attitude); visibleOnMap is true only when none apply.
   // Falls back to inferring attitude from marker icons when no manual/cached value exists.
   function getProfileVisibilityState(profileId) {
     if (shouldLog("verbose")) log("→ getProfileVisibilityState", traceArgs(arguments));
@@ -9616,7 +9713,7 @@ ${JSON.stringify(fileContent)}\r
     }, 1500);
   }
   // Global observer: detect profile/container changes on the SPA and schedule a display refresh.
-  // Body MutationObserver (href/data-testid/class) + 1500ms poll; also kicks an initial refresh.
+  // Body MutationObserver (href/data-testid only — see attributeFilter below) + 1500ms poll; also kicks an initial refresh.
   function observeProfileChanges() {
     if (shouldLog("verbose")) log("→ observeProfileChanges", traceArgs(arguments));
     let lastProfileId = null;
@@ -10345,12 +10442,18 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
         prunedIncludeMatches += 1;
       }
     }
-    // Cap the dismissed-id set at 1500; rebuild it to keep only ids still in includeMatches.
+    // Cap the dismissed-id set at 1500 by evicting the oldest entries (Set iteration order == insertion
+    // order). A dismissed id is REMOVED from includeMatches at dismiss time (see dismissAllIncludeMatches),
+    // so rebuilding from includeMatches' current membership would keep only currently-active (i.e. NOT
+    // dismissed) ids and wipe almost all real dismissal history — trim by recency instead.
     if (includeDismissed.size > 1500) {
-      const keep = /* @__PURE__ */ new Set();
-      for (const id of includeMatches.keys()) keep.add(id);
-      includeDismissed.clear();
-      for (const id of keep) includeDismissed.add(id);
+      const excess = includeDismissed.size - 1500;
+      const it = includeDismissed.values();
+      for (let i = 0; i < excess; i++) {
+        const next = it.next();
+        if (next.done) break;
+        includeDismissed.delete(next.value);
+      }
     }
     for (const [id, retryTs] of profileTextRetryAt.entries()) {
       const retry = parseTimestamp(retryTs);
@@ -12197,32 +12300,35 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   });
   // Debug helper: saves 'text' as a quick phrase (default category 'other') via saveQuickPhraseFromText.
   const sniffiesAddQuickPhrase = (text, category = "other") => saveQuickPhraseFromText(text, category);
-  // exposeGlobal writes each helper onto window, globalThis, and Tampermonkey's unsafeWindow so it is callable from the page console.
+  // exposeGlobal writes each helper onto window, globalThis, and (unless sandboxOnly:true, see its
+  // own doc comment) Tampermonkey's unsafeWindow so it is callable from the page console. Anything
+  // that mutates state, triggers network calls, sends messages, or exposes bookmark/appointment
+  // content is sandboxOnly — reachable only from the userscript's own sandbox realm, not the page's.
   exposeGlobal("__sniffiesShowMatchPanel", sniffiesShowMatchPanel);
   exposeGlobal("__sniffiesShowPanel", sniffiesShowPanel);
   exposeGlobal("__sniffiesHidePanel", sniffiesHidePanel);
   exposeGlobal("__sniffiesGetSettings", sniffiesGetSettings);
-  exposeGlobal("__sniffiesUpdateSettings", updateSettingsFromPopup);
-  exposeGlobal("__sniffiesRunAction", runPopupAction);
+  exposeGlobal("__sniffiesUpdateSettings", updateSettingsFromPopup, { sandboxOnly: true });
+  exposeGlobal("__sniffiesRunAction", runPopupAction, { sandboxOnly: true });
   exposeGlobal("__sniffiesProfileTextStats", sniffiesProfileTextStats);
-  exposeGlobal("__sniffiesForceFullTextFetch", sniffiesForceFullTextFetch);
+  exposeGlobal("__sniffiesForceFullTextFetch", sniffiesForceFullTextFetch, { sandboxOnly: true });
   exposeGlobal("__sniffiesSoftFilterStats", sniffiesSoftFilterStats);
   exposeGlobal("__sniffiesSoftFilterDebug", sniffiesSoftFilterStats);
-  exposeGlobal("__sniffiesForcePartialsFetch", sniffiesForcePartialsFetch);
+  exposeGlobal("__sniffiesForcePartialsFetch", sniffiesForcePartialsFetch, { sandboxOnly: true });
   exposeGlobal("__sniffiesExtractAttitude", sniffiesExtractAttitude);
   exposeGlobal("__sniffiesChatAgeStats", sniffiesChatAgeStats);
-  exposeGlobal("__sniffiesSetSelfId", sniffiesSetSelfId);
-  exposeGlobal("__sniffiesForceChatRefresh", sniffiesForceChatRefresh);
-  exposeGlobal("__sniffiesRescanChatAges", sniffiesRescanChatAges);
+  exposeGlobal("__sniffiesSetSelfId", sniffiesSetSelfId, { sandboxOnly: true });
+  exposeGlobal("__sniffiesForceChatRefresh", sniffiesForceChatRefresh, { sandboxOnly: true });
+  exposeGlobal("__sniffiesRescanChatAges", sniffiesRescanChatAges, { sandboxOnly: true });
   exposeGlobal("__sniffiesChatCaptureDebug", sniffiesChatCaptureDebug);
   exposeGlobal("__sniffiesChatBadgeDebug", sniffiesChatBadgeDebug);
-  exposeGlobal("__sniffiesAppointments", sniffiesAppointments);
-  exposeGlobal("__sniffiesBookmarks", sniffiesBookmarks);
-  exposeGlobal("__sniffiesBroadcastToBookmarks", sniffiesBroadcastToBookmarks);
-  exposeGlobal("__sniffiesStopBroadcast", sniffiesStopBroadcast);
+  exposeGlobal("__sniffiesAppointments", sniffiesAppointments, { sandboxOnly: true });
+  exposeGlobal("__sniffiesBookmarks", sniffiesBookmarks, { sandboxOnly: true });
+  exposeGlobal("__sniffiesBroadcastToBookmarks", sniffiesBroadcastToBookmarks, { sandboxOnly: true });
+  exposeGlobal("__sniffiesStopBroadcast", sniffiesStopBroadcast, { sandboxOnly: true });
   exposeGlobal("__sniffiesMemoryStats", sniffiesMemoryStats);
-  exposeGlobal("__sniffiesRunMemoryGc", sniffiesRunMemoryGc);
-  exposeGlobal("__sniffiesTeardown", teardownSniffies);
+  exposeGlobal("__sniffiesRunMemoryGc", sniffiesRunMemoryGc, { sandboxOnly: true });
+  exposeGlobal("__sniffiesTeardown", teardownSniffies, { sandboxOnly: true });
   exposeGlobal("__sniffiesGetProfileTableData", sniffiesGetProfileTableData);
   exposeGlobal("__sniffiesProfileLastActive", () => {
     const t = now();
@@ -12234,7 +12340,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     return out;
   });
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases);
-  exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase);
+  exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.11.1)");
+  logInfo("Sniffies soft filter loaded (v0.11.2)");
 })();

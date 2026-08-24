@@ -28,13 +28,15 @@ const WARMABLE = /\.(c?js|mjs|json|node)$/;
 // the moment you run the suite, but stays NON-FATAL: test success is not coupled
 // to doc freshness, so a stale index only warns. Flip the `console.warn` to a
 // `throw` if you'd rather hard-fail the suite on drift.
+// regen-index.mjs is intentionally NOT vendored into this repo — it's shared tooling that lives at
+// ~/.claude/skill-consolidation/regen-index.mjs across the owner's other projects (see CLAUDE.md).
+// On a checkout without it, execFileP below throws ENOENT and this warns instead of failing the suite.
 async function checkIndexFreshness() {
   const script = fileURLToPath(new URL("../regen-index.mjs", import.meta.url));
   try {
     await execFileP(process.execPath, [script, "--check"]);
   } catch (err) {
     const msg = String(err.stderr || err.message || err).trim();
-    // eslint-disable-next-line no-console
     console.warn(`[global-setup] INDEX.md drift check — ${msg}`);
   }
 }
@@ -73,7 +75,6 @@ export default async function warmNodeModulesCache() {
   const ms = Date.now() - started;
   // Only surface this when it was actually slow, so warm runs stay quiet.
   if (ms > 3000) {
-    // eslint-disable-next-line no-console
     console.log(`[global-setup] warmed ${paths.length} node_modules files in ${ms}ms`);
   }
 

@@ -11,6 +11,12 @@ npm run lint
 echo "pre-commit: tests…"
 npm test
 echo "pre-commit: INDEX.md freshness…"
-# Index tooling lives in the central consolidation dir (moved out of this repo).
-node ~/.claude/skill-consolidation/regen-index.mjs --check
+# Index tooling lives in the central consolidation dir (moved out of this repo, shared across the
+# owner's other projects) — degrade to a warning rather than blocking every commit (even ones that
+# don't touch the userscript) on a machine/checkout where that external tool isn't present.
+if [ -f "$HOME/.claude/skill-consolidation/regen-index.mjs" ]; then
+  node "$HOME/.claude/skill-consolidation/regen-index.mjs" --check || echo "pre-commit: INDEX.md stale, continuing"
+else
+  echo "pre-commit: regen-index.mjs not found locally, skipping INDEX.md freshness check"
+fi
 echo "pre-commit: ok"
