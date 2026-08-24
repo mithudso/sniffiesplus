@@ -1,0 +1,72 @@
+// Test harness: turns the single-IIFE userscript into something testable WITHOUT modifying it.
+//
+// The userscript is one big IIFE with no exports. We read the canonical .txt, derive the list of
+// top-level function names, and inject — just before the IIFE closes — an assignment that exposes
+// every top-level function (plus key module state) onto `window.__SNIFFIES_INTERNALS`. The harness
+// then boots that source once in a jsdom + WebCrypto + mocked-GM/fetch sandbox (see setup.mjs) and
+// hands tests the internals. The .txt on disk is never touched.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// Resolve the userscript regardless of version-bumped filename. Picks the highest -X.Y.Z version,
+// NOT the lexicographically-last filename — a plain string sort would rank "0.11.0" before "0.8.2"
+// (comparing "1" < "8" at the first differing character), silently testing a stale, superseded file.
+import { readdirSync } from "node:fs";
+const ROOT = path.resolve(HERE, "..");
+function versionOf(name) {
+  const m = name.match(/-(\d+)\.(\d+)\.(\d+)(?:\s+\d+)?\.txt$/);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [-1, -1, -1];
+}
+function compareVersions(a, b) {
+  const va = versionOf(a), vb = versionOf(b);
+  for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return va[i] - vb[i];
+  return 0;
+}
+const SRC_NAME = readdirSync(ROOT)
+  .filter((f) => /^Sniffies Soft Filter .*\.txt$/.test(f))
+  .sort(compareVersions)
+  .pop();
+if (!SRC_NAME) throw new Error("Could not find the Sniffies userscript .txt next to test/");
+export const SRC_PATH = path.join(ROOT, SRC_NAME);
+
+// Module-state handles worth exposing for tests (live references to the in-memory maps/objects).
+const STATE_HANDLES = [
+  "state", "chatActivity", "profileLastActive", "blocked", "bookmarks", "notes", "appointments",
+  "attitudeCache", "idToMarker", "manualAttitudes", "howdySentAt", "iconRules", "profileRatings",
+  "profileFilterCache", "profileTextCache", "includeMatches", "selfProfileIds",
+];
+
+// Derive top-level function names directly from the source (2-space indent == direct IIFE child).
+export function topLevelFunctionNames(src) {
+  const re = /^ {2}(?:async )?function ([A-Za-z0-9_]+)\(/;
+  const out = [];
+  for (const line of src.split("\n")) {
+    const m = line.match(re);
+    if (m) out.push(m[1]);
+  }
+  return [...new Set(out)];
+}
+
+export function buildTestableSource() {
+  const src = readFileSync(SRC_PATH, "utf8");
+  const fns = topLevelFunctionNames(src);
+  const idx = src.lastIndexOf("})();");
+  if (idx < 0) throw new Error("Could not locate the IIFE close `})();`");
+  const inject =
+    "\n;try{(typeof window!==\"undefined\"?window:globalThis).__SNIFFIES_INTERNALS={" +
+    fns.join(",") +
+    ",__state:{" + STATE_HANDLES.join(",") + "}" +
+    "};}catch(e){(typeof window!==\"undefined\"?window:globalThis).__SNIFFIES_INTERNALS_ERR=String((e&&e.stack)||e);}\n";
+  return { code: src.slice(0, idx) + inject + src.slice(idx), functionNames: fns };
+}
+
+// Read the internals the booted script exposed; throws a useful error if boot failed.
+export function getInternals() {
+  const g = globalThis;
+  if (g.__SNIFFIES_INTERNALS) return g.__SNIFFIES_INTERNALS;
+  if (g.__SNIFFIES_INTERNALS_ERR) throw new Error("Userscript boot failed:\n" + g.__SNIFFIES_INTERNALS_ERR);
+  throw new Error("Userscript was not booted (setup.mjs did not run, or boot threw before injection).");
+}

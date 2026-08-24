@@ -1,0 +1,16 @@
+node_modules/
+coverage/
+*.bak
+.DS_Store
+*.sublime-workspace
+# iCloud/Finder duplicate-on-conflict copies of the versioned .txt (e.g. "...-0.10.0 2.txt") —
+# stale snapshots, not source. Git history is now the source of truth for prior versions.
+* [0-9].txt
+# Superseded full-file version snapshots kept on disk for local reference, predating git —
+# git history is the source of truth for prior versions going forward.
+Sniffies Soft Filter (Bottom - Vers Bottom)-0.8.2.txt
+# Sniffies' own production app bundle (MapLibre GL, their Angular build, Chargebee JS, fonts) —
+# saved locally as reverse-engineering reference for SITE-INDEX.md (see CLAUDE.md). It's their
+# compiled/third-party code, not ours to redistribute — kept on disk, never pushed publicly.
+Sniffies App _ Map.html
+Sniffies App _ Map_files/

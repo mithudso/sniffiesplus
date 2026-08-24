@@ -1,0 +1,23 @@
+name: CI
+
+# Dev-only quality gate. The shipped userscript is a single dependency-free .txt and is unaffected by
+# any of this tooling; CI just guards the test suite and lint on push / PR. (The INDEX.md freshness
+# check moved out of this repo to ~/.claude/skill-consolidation/ and now runs only locally.)
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: Lint (correctness rules over the userscript + tooling)
+        run: npm run lint
+      - name: Unit tests (vitest + jsdom)
+        run: npm test

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Dev-only pre-commit gate. The shipped userscript .txt is dependency-free and unaffected by this.
+#
+# This repo isn't git-initialized by default. To enable once you `git init`:
+#     git config core.hooksPath .githooks
+#
+# Runs lint + tests + INDEX.md freshness; aborts the commit on any failure.
+set -e
+echo "pre-commit: lint…"
+npm run lint
+echo "pre-commit: tests…"
+npm test
+echo "pre-commit: INDEX.md freshness…"
+# Index tooling lives in the central consolidation dir (moved out of this repo).
+node ~/.claude/skill-consolidation/regen-index.mjs --check
+echo "pre-commit: ok"
