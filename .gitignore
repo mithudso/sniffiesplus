@@ -14,3 +14,5 @@ Sniffies Soft Filter (Bottom - Vers Bottom)-0.8.2.txt
 # compiled/third-party code, not ours to redistribute — kept on disk, never pushed publicly.
 Sniffies App _ Map.html
 Sniffies App _ Map_files/
+# Claude Code local session state (worktrees, etc.) — never repo content.
+.claude/
