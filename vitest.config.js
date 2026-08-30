@@ -9,6 +9,10 @@ export default defineConfig({
     // vitest's (non-configurable) worker-start timeout. See test/global-setup.mjs.
     globalSetup: ["./test/global-setup.mjs"],
     include: ["test/**/*.test.mjs"],
+    // The interaction-library suites (test/lib/**) use node:test, not vitest, and need no jsdom
+    // userscript boot — they run via `npm run test:lib`. Exclude them here so vitest doesn't try to
+    // load them as (empty) vitest suites.
+    exclude: ["test/lib/**", "node_modules/**"],
     globals: true,
     // The harness boots the whole userscript IIFE per test file; give it room.
     testTimeout: 15000,

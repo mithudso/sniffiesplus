@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { getInternals } from "./harness.mjs";
+import { getInternals, buildTestableSource } from "./harness.mjs";
 
 describe("harness boot", () => {
   let S;
@@ -7,7 +7,12 @@ describe("harness boot", () => {
 
   it("boots the IIFE and exposes top-level functions", () => {
     const fnCount = Object.keys(S).filter((k) => typeof S[k] === "function").length;
-    expect(fnCount).toBeGreaterThan(380);
+    // Source-derived expectation (was a hand-typed floor that drifted below reality).
+    expect(fnCount).toBe(buildTestableSource().functionNames.length);
+  });
+
+  it("has a jsdom document (environment canary, folded in from the deleted trivial.test.mjs)", () => {
+    expect(document.createElement("div").tagName).toBe("DIV");
   });
 
   it("exposes live module-state handles", () => {

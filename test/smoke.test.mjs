@@ -1,12 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { getInternals } from "./harness.mjs";
+import { getInternals, buildTestableSource } from "./harness.mjs";
 
 const S = getInternals();
 const fnNames = Object.keys(S).filter((k) => typeof S[k] === "function").sort();
 
 describe("smoke: full function surface", () => {
   it("exposes every top-level function as a callable", () => {
-    expect(fnNames.length).toBeGreaterThanOrEqual(419);
+    // Exact, source-derived expectation (was a hand-typed floor of 419 that silently tolerated
+    // deleting ~30 functions): the injected surface must match the source's own function list.
+    const expected = buildTestableSource().functionNames.length;
+    expect(fnNames.length).toBe(expected);
     for (const n of fnNames) expect(typeof S[n]).toBe("function");
   });
 

@@ -1,15 +1,18 @@
 {
   "name": "sniffies-soft-filter",
   "private": true,
-  "version": "0.11.2",
+  "version": "0.0.0",
   "type": "module",
-  "description": "Tests for the Sniffies Soft Filter userscript (dev-only tooling; the userscript ships as a single .txt and is unaffected by this).",
+  "description": "Dev tooling + interaction library for the Sniffies Soft Filter userscript. The userscript itself ships as a single .txt and is dependency-free; the version of record lives in its @version header, not here.",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
+    "test:lib": "node --test 'test/lib/*.test.mjs'",
     "lint": "eslint .",
-    "check": "npm run lint && npm test && node ~/.claude/skill-consolidation/regen-index.mjs --check"
+    "build:lib": "node scripts/build-lib.mjs",
+    "build:check": "node scripts/build-lib.mjs && git diff --exit-code -- dist/",
+    "check": "npm run lint && npm test && npm run test:lib && npm run build:check"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.1.9",

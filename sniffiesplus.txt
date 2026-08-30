@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.11.2
-// @last-change  2026-08-24 00:00:00 EDT
+// @version      0.11.4
+// @last-change  2026-08-30 00:00:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
 // @grant        GM_openInTab
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        unsafeWindow
 // ==/UserScript==
 
 /*
@@ -30,6 +31,7 @@ Primary controls:
   - Time flag on markers: show/hide chat-age badge on visible markers.
   - Hide chatted in last 24h: hide profiles with recent interaction, but
     auto-unhide one as soon as they reply (their last message newer than yours).
+  - Hide chatted in last 2h: same as the 24h control with a 2-hour window.
   - Hide not online in last <window>: hide profiles whose last-online time (from
     the partials feed) is older than the selected window. The window is chosen
     next to the toggle: 10 minutes, 2 hours, or a Custom number of minutes (1 to
@@ -43,7 +45,8 @@ Primary controls:
   - Global Chat: any message whose author is currently hidden by the filters
     above is also hidden in the Global Chat. The author is the message element's
     profile id; attitude/position is read from the message header when the author
-    is not on the map. Always on while Enabled (no separate toggle).
+    is not on the map. On by default; the top-bar Global Chat button toggles the
+    auto-filter. Manual blocks (middle-click) still apply while it is off.
 
 Map/profile shortcuts:
   - Shift + left-click marker: hide/unhide profile (block toggle).
@@ -215,11 +218,21 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   const LAST_ACTIVE_TTL_MS = 24 * 60 * 60 * 1e3;
   const CHAT_PREVIEW_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
   const CHAT_DELETE_RETENTION_MS = 180 * 24 * 60 * 60 * 1e3;
+  // Memory-GC retention windows (were inline arithmetic inside runMemoryGc, breaking the
+  // named-tuning-constant convention the rest of this block follows).
+  const PHRASE_HISTORY_RETENTION_MS = 90 * 24 * 60 * 60 * 1e3;
+  const PHRASE_STATS_RETENTION_MS = 180 * 24 * 60 * 60 * 1e3;
+  const HOWDY_RETENTION_MS = 7 * 24 * 60 * 60 * 1e3;
   const MEMORY_GC_INTERVAL_MS = 90 * 1e3;
   const CACHE_RETENTION_MS = 90 * 60 * 1e3;
   const ATTITUDE_RETENTION_MS = 180 * 60 * 1e3;
   const RETRY_RETENTION_MS = 60 * 60 * 1e3;
   const HIDE_CLASS = "sniffies-soft-hide";
+  const HIDE_CLASS_SELECTOR = "." + HIDE_CLASS;
+  // Every panel/launcher this script owns — one shared skip selector (was 5 drifting inline copies;
+  // two of them omitted .sniffies-chat-phrases-panel, so the composer finder could match the Quick
+  // Phrases panel's own input). .sniffies-chat-phrase-menu is the phrase context menu.
+  const NAV_PANEL_SKIP_SELECTOR = ".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-panel, .sniffies-chat-phrases-launcher, .sniffies-chat-phrase-menu, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal";
   // ---- Versioned localStorage key names. Arrays are ordered NEWEST-FIRST: loaders read the
   // first key that exists (migrating old data forward); writers always persist to index [0].
   // To change a stored shape, bump the version and PREPEND the new key -- never rewrite old keys. ----
@@ -1644,6 +1657,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   let pendingRefreshTimer = 0;
   let updatePartialsBusy = false;
   let updatePartialsQueued = false;
+  // Promise for the in-flight updatePartials run, so re-entrant awaiting callers wait for real completion.
+  let updatePartialsInFlight = null;
   let gdriveSyncBusy = false;
   let gdriveSyncQueued = false;
   let profileExcludeTerms = [];
@@ -1652,7 +1667,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   let chatDeletionSaveTimer = 0;
   let chatBadgeRefreshTimer = 0;
   let chatCaptureInstalled = false;
-  let chatStorageScanTimer = 0;
+  let chatStorageScanNextAt = 0; // deadline timestamp (NOT a timer handle; renamed so no cleanup pass tries clearTimeout on it)
   const autoMessageTabHandles = /* @__PURE__ */ new Map();
   let profileContainerObserver = null;
   let globalChatHideObserver = null;
@@ -1683,9 +1698,25 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     urls: {},
     recent: []
   };
-  let preferredMode = localStorage.getItem(MODE_KEY) || "userIds";
-  let preferredBase = localStorage.getItem(BASE_KEY) || "https://usw.api.sniffies.com/api/user/partials";
-  let preferredFullBase = localStorage.getItem(FULL_BASE_KEY) || "https://usw.api.sniffies.com";
+  // Validated on read: an unexpected stored value (e.g. "toString") would otherwise reach
+  // Object.prototype through the payload-builder lookup in fetchPartials.
+  let preferredMode = ["userIds", "profileIds", "ids", "array"].includes(localStorage.getItem(MODE_KEY)) ? localStorage.getItem(MODE_KEY) : "userIds";
+  // The persisted API bases are used as CREDENTIALED fetch targets, and localStorage is writable by
+  // any script on the origin — so a stored value is only honored when its origin is on the explicit
+  // Sniffies API allowlist; anything else falls back to the default (poisoned key ≠ exfil endpoint).
+  const ALLOWED_API_ORIGINS = new Set([
+    "https://usw.api.sniffies.com",
+    "https://uswapi2.sniffies.com",
+    "https://uswapi.sniffies.com",
+  ]);
+  function validatedApiUrl(raw, fallback) {
+    try {
+      if (raw && ALLOWED_API_ORIGINS.has(new URL(String(raw)).origin)) return String(raw);
+    } catch (e) {}
+    return fallback;
+  }
+  let preferredBase = validatedApiUrl(localStorage.getItem(BASE_KEY), "https://usw.api.sniffies.com/api/user/partials");
+  let preferredFullBase = validatedApiUrl(localStorage.getItem(FULL_BASE_KEY), "https://usw.api.sniffies.com");
   const profileTextRetryAt = /* @__PURE__ */ new Map();
   const fullProfileFetchInFlight = /* @__PURE__ */ new Set();
   let statusEl = null;
@@ -1704,12 +1735,27 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     return Object.prototype.hasOwnProperty.call(LOG_VERBOSITY_LEVELS, raw) ? raw : "quiet";
   }
+  // Cached numeric verbosity so the ~400 shouldLog() guards on hot paths (per-marker predicates,
+  // chat-payload BFS) cost an integer compare, not two string allocations + a hasOwnProperty probe.
+  // -1 = not yet resolved (state still in TDZ during load); refreshLogLevelCache() re-resolves after
+  // any state.logVerbosity assignment (loadState/import/panel handler all call saveState → refresh).
+  // `var` (not let) deliberately: shouldLog fires from the load*() helpers during `let state =
+  // loadState()`, before this statement executes — var hoists to undefined (guards below treat that
+  // as unresolved) where a let binding would throw a TDZ ReferenceError and kill the boot.
+  var cachedLogLevelNum = -1;
+  function refreshLogLevelCache() {
+    var _a;
+    cachedLogLevelNum = (_a = LOG_VERBOSITY_LEVELS[currentLogVerbosity()]) != null ? _a : 0;
+  }
   // True when the configured verbosity meets/exceeds the message's level (quiet<normal<verbose).
   // Unknown level arg defaults to 'normal' (target 1).
   function shouldLog(level = "normal") {
     var _a, _b;
-    const current = (_a = LOG_VERBOSITY_LEVELS[currentLogVerbosity()]) != null ? _a : 0;
-    const target = (_b = LOG_VERBOSITY_LEVELS[String(level || "normal").toLowerCase()]) != null ? _b : 1;
+    if (cachedLogLevelNum < 0) {
+      try { if (state) refreshLogLevelCache(); } catch (e) {}
+    }
+    const current = cachedLogLevelNum >= 0 ? cachedLogLevelNum : ((_a = LOG_VERBOSITY_LEVELS[currentLogVerbosity()]) != null ? _a : 0);
+    const target = level === "verbose" ? 2 : level === "quiet" ? 0 : level === "normal" ? 1 : ((_b = LOG_VERBOSITY_LEVELS[String(level || "normal").toLowerCase()]) != null ? _b : 1);
     return current >= target;
   }
   // console.debug with prefix; only emits at 'verbose' verbosity.
@@ -1720,7 +1766,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function tracePreview(v, depth) {
     if (v == null) return v;
     const t = typeof v;
-    if (t === "string") return v.length > 40 ? "[str:" + v.length + "]" : v;
+    if (t === "string") return v.length > 12 ? "[str:" + v.length + "]" : v;
     if (t === "number" || t === "boolean") return v;
     if (t === "bigint" || t === "symbol" || t === "function") return "[" + t + "]";
     try {
@@ -1757,8 +1803,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (shouldLog("normal")) console.info(LOG_PREFIX, ...args);
   }
   // console.warn with prefix + ' WARN'; gated at 'normal' verbosity or higher.
+  // Unconditional, like logError: operational-failure warnings (chat-capture patch not applied, GM
+  // storage unavailable, non-OK API responses, rejected forged cross-tab signals) must be visible at
+  // the shipped default verbosity ("quiet") — a warn gated at "normal" made core features die
+  // silently. Verbose call-trace noise stays on log()/logInfo(), which remain verbosity-gated.
   function logWarn(...args) {
-    if (shouldLog("normal")) console.warn(`${LOG_PREFIX} WARN`, ...args);
+    console.warn(`${LOG_PREFIX} WARN`, ...args);
   }
   // console.error with prefix; the only logger that emits unconditionally (ignores verbosity).
   function logError(...args) {
@@ -1855,13 +1905,31 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     const digest = await crypto.subtle.digest("SHA-256", data);
     return toBase64Url(bytesToBase64(new Uint8Array(digest)));
   }
+  // Safe localStorage.setItem wrapper (mirrors gmSetValueSafe): a QuotaExceededError from a
+  // checkbox/blur handler must not abort the applyHiding() that follows it, and must be visible —
+  // logged unconditionally and surfaced in the status line — instead of a silent throw.
+  function lsSetSafe(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (e) {
+      try {
+        logError(`localStorage.setItem failed for ${key}`, e && e.name, e);
+        if ((e && e.name) === "QuotaExceededError" && typeof setStatus === "function") setStatus("Storage full — settings not saved");
+      } catch (e2) {}
+      return false;
+    }
+  }
   // Safe GM_getValue wrapper: returns fallback if GM API absent or it throws.
+  // Falls back to the Greasemonkey 4 promise API (GM.getValue) when the legacy global is missing.
   // Awaits the result when GM_getValue returns a thenable (handles async GM impls).
   async function gmGetValueSafe(key, fallback = null) {
     log("→ gmGetValueSafe");
-    if (typeof GM_getValue !== "function") return fallback;
+    const fn = typeof GM_getValue === "function" ? GM_getValue
+      : (typeof GM !== "undefined" && GM && typeof GM.getValue === "function") ? GM.getValue.bind(GM) : null;
+    if (!fn) return fallback;
     try {
-      const value = GM_getValue(key, fallback);
+      const value = fn(key, fallback);
       // Thenable detection: awaits async GM_getValue impls, passes through sync ones.
       return value && typeof value.then === "function" ? await value : value;
     } catch (e) {
@@ -1869,11 +1937,14 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
   }
   // Safe GM_setValue wrapper returning true/false; awaits a thenable result, swallows errors.
+  // Falls back to GM.setValue (Greasemonkey 4+) when the legacy global is missing.
   async function gmSetValueSafe(key, value) {
     log("→ gmSetValueSafe");
-    if (typeof GM_setValue !== "function") return false;
+    const fn = typeof GM_setValue === "function" ? GM_setValue
+      : (typeof GM !== "undefined" && GM && typeof GM.setValue === "function") ? GM.setValue.bind(GM) : null;
+    if (!fn) return false;
     try {
-      const result = GM_setValue(key, value);
+      const result = fn(key, value);
       if (result && typeof result.then === "function") await result;
       return true;
     } catch (e) {
@@ -1881,11 +1952,14 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
   }
   // Safe GM_deleteValue wrapper returning true/false; awaits a thenable result, swallows errors.
+  // Falls back to GM.deleteValue (Greasemonkey 4+) when the legacy global is missing.
   async function gmDeleteValueSafe(key) {
     log("→ gmDeleteValueSafe");
-    if (typeof GM_deleteValue !== "function") return false;
+    const fn = typeof GM_deleteValue === "function" ? GM_deleteValue
+      : (typeof GM !== "undefined" && GM && typeof GM.deleteValue === "function") ? GM.deleteValue.bind(GM) : null;
+    if (!fn) return false;
     try {
-      const result = GM_deleteValue(key);
+      const result = fn(key);
       if (result && typeof result.then === "function") await result;
       return true;
     } catch (e) {
@@ -1894,13 +1968,13 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Derive a non-extractable AES-GCM-256 key from a passphrase via PBKDF2-SHA256.
   // Uses 210000 iterations (EXPORT_ENC_ITERATIONS) with the caller-supplied salt.
-  async function derivePassphraseKey(passphrase, saltBytes, usage = ["encrypt", "decrypt"]) {
+  async function derivePassphraseKey(passphrase, saltBytes, usage = ["encrypt", "decrypt"], iterations = EXPORT_ENC_ITERATIONS) {
     log("→ derivePassphraseKey");
     const passBytes = new TextEncoder().encode(String(passphrase || ""));
     const keyMaterial = await crypto.subtle.importKey("raw", passBytes, "PBKDF2", false, ["deriveKey"]);
     return crypto.subtle.deriveKey(
-      // PBKDF2-SHA256 at 210k iterations stretches the passphrase into the AES key.
-      { name: "PBKDF2", salt: saltBytes, iterations: EXPORT_ENC_ITERATIONS, hash: "SHA-256" },
+      // PBKDF2-SHA256 (default 210k iterations; decrypt passes the envelope's own count so old exports stay readable).
+      { name: "PBKDF2", salt: saltBytes, iterations, hash: "SHA-256" },
       keyMaterial,
       { name: EXPORT_ENC_ALGO, length: 256 },
       false,
@@ -1935,11 +2009,22 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   async function decryptStringWithPassphrase(envelope, passphrase) {
     log("→ decryptStringWithPassphrase");
     if (!hasSubtleCrypto()) throw new Error("WebCrypto unavailable");
+    // Honor the envelope's self-describing fields instead of assuming the CURRENT constants — a
+    // future parameter bump must not silently make old exports undecryptable (and misreport it as
+    // a wrong passphrase). Unknown alg / newer version / degenerate params are rejected explicitly.
+    const envVersion = Number((envelope == null ? void 0 : envelope.version) || 1);
+    if (envVersion > EXPORT_ENC_VERSION) throw new Error(`Unsupported export version ${envVersion} (this build supports <= ${EXPORT_ENC_VERSION})`);
+    const envAlg = String((envelope == null ? void 0 : envelope.alg) || EXPORT_ENC_ALGO);
+    if (envAlg !== "AES-GCM") throw new Error(`Unsupported export algorithm ${envAlg}`);
+    // Iterations floor 100k (below that the envelope is degenerate/tampered), ceiling 5M (DoS guard).
+    const envIterations = Math.round(Number((envelope == null ? void 0 : envelope.iterations) || EXPORT_ENC_ITERATIONS));
+    if (!Number.isFinite(envIterations) || envIterations < 1e5 || envIterations > 5e6) throw new Error("Export envelope has an invalid PBKDF2 iteration count");
     const salt = base64ToBytes((envelope == null ? void 0 : envelope.salt) || "");
     const iv = base64ToBytes((envelope == null ? void 0 : envelope.iv) || "");
     const ciphertext = base64ToBytes((envelope == null ? void 0 : envelope.ciphertext) || "");
-    const key = await derivePassphraseKey(passphrase, salt, ["decrypt"]);
-    const plainBuffer = await crypto.subtle.decrypt({ name: EXPORT_ENC_ALGO, iv }, key, ciphertext);
+    if (!salt.length || !iv.length) throw new Error("Export envelope is missing salt/iv");
+    const key = await derivePassphraseKey(passphrase, salt, ["decrypt"], envIterations);
+    const plainBuffer = await crypto.subtle.decrypt({ name: envAlg, iv }, key, ciphertext);
     return new TextDecoder().decode(new Uint8Array(plainBuffer));
   }
   // Try navigator.clipboard.writeText; on failure or absence, show a prompt() for manual copy.
@@ -2121,7 +2206,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       count: Number((result == null ? void 0 : result.count) || 0),
       category: (result == null ? void 0 : result.category) || normalizeQuickPhraseCategory(category),
       ts: (/* @__PURE__ */ new Date()).toISOString()
-    });
+    }, { sandboxOnly: true });
     if (result.ok) {
       setStatus(`Quick phrase added (${result.count})`);
       return result;
@@ -2237,92 +2322,72 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     profileIncludeTerms = parseTerms(state.includeProfileTerms);
   }
   refreshProfileTerms();
-  // Read the saved match-panel {left,top} from localStorage; returns null if absent, unparseable, or coords aren't numbers.
+  // Generic panel-position persistence (was 12 near-identical per-panel helpers). loadPanelPos
+  // returns the saved {left,top} or null; savePanelPos persists; applyPanelPos applies with >=0
+  // clamping, clearing whichever opposing anchors the caller names so left/top anchoring wins.
+  function loadPanelPos(key) {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    try {
+      const pos = JSON.parse(raw);
+      if (typeof pos.left === "number" && typeof pos.top === "number") return pos;
+    } catch (e) {
+    }
+    return null;
+  }
+  function savePanelPos(key, left, top) {
+    lsSetSafe(key, JSON.stringify({ left, top }));
+  }
+  function applyPanelPos(panel2, key, { clearRight = false, clearBottom = false } = {}) {
+    const pos = loadPanelPos(key);
+    if (!pos || !panel2) return;
+    panel2.style.left = `${Math.max(0, pos.left)}px`;
+    panel2.style.top = `${Math.max(0, pos.top)}px`;
+    if (clearRight) panel2.style.right = "auto";
+    if (clearBottom) panel2.style.bottom = "auto";
+  }
+  // Per-panel wrappers preserved as the public seam (call sites, drag callbacks, tests).
   function loadMatchPanelPos() {
     if (shouldLog("verbose")) log("→ loadMatchPanelPos", traceArgs(arguments));
-    const raw = localStorage.getItem(MATCH_PANEL_POS_KEY);
-    if (!raw) return null;
-    try {
-      const pos = JSON.parse(raw);
-      if (typeof pos.left === "number" && typeof pos.top === "number") return pos;
-    } catch (e) {
-    }
-    return null;
+    return loadPanelPos(MATCH_PANEL_POS_KEY);
   }
-  // Persist match-panel position {left,top} to localStorage.
   function saveMatchPanelPos(left, top) {
     if (shouldLog("verbose")) log("→ saveMatchPanelPos", traceArgs(arguments));
-    localStorage.setItem(MATCH_PANEL_POS_KEY, JSON.stringify({ left, top }));
+    savePanelPos(MATCH_PANEL_POS_KEY, left, top);
   }
-  // Read the saved soft (main) panel {left,top} from localStorage; null if absent/invalid.
   function loadSoftPanelPos() {
     if (shouldLog("verbose")) log("→ loadSoftPanelPos", traceArgs(arguments));
-    const raw = localStorage.getItem(PANEL_POS_KEY);
-    if (!raw) return null;
-    try {
-      const pos = JSON.parse(raw);
-      if (typeof pos.left === "number" && typeof pos.top === "number") return pos;
-    } catch (e) {
-    }
-    return null;
+    return loadPanelPos(PANEL_POS_KEY);
   }
-  // Persist soft (main) panel position {left,top} to localStorage.
   function saveSoftPanelPos(left, top) {
     if (shouldLog("verbose")) log("→ saveSoftPanelPos", traceArgs(arguments));
-    localStorage.setItem(PANEL_POS_KEY, JSON.stringify({ left, top }));
+    savePanelPos(PANEL_POS_KEY, left, top);
   }
-  // Read the saved appointment-panel {left,top} from localStorage; null if absent/invalid.
   function loadApptPanelPos() {
     if (shouldLog("verbose")) log("→ loadApptPanelPos", traceArgs(arguments));
-    const raw = localStorage.getItem(APPT_PANEL_POS_KEY);
-    if (!raw) return null;
-    try {
-      const pos = JSON.parse(raw);
-      if (typeof pos.left === "number" && typeof pos.top === "number") return pos;
-    } catch (e) {
-    }
-    return null;
+    return loadPanelPos(APPT_PANEL_POS_KEY);
   }
-  // Persist appointment-panel position {left,top} to localStorage.
   function saveApptPanelPos(left, top) {
     if (shouldLog("verbose")) log("→ saveApptPanelPos", traceArgs(arguments));
-    localStorage.setItem(APPT_PANEL_POS_KEY, JSON.stringify({ left, top }));
+    savePanelPos(APPT_PANEL_POS_KEY, left, top);
   }
-  // Read the saved bookmark-panel {left,top} from localStorage; null if absent/invalid.
   function loadBookmarkPanelPos() {
     if (shouldLog("verbose")) log("→ loadBookmarkPanelPos", traceArgs(arguments));
-    const raw = localStorage.getItem(BOOKMARK_PANEL_POS_KEY);
-    if (!raw) return null;
-    try {
-      const pos = JSON.parse(raw);
-      if (typeof pos.left === "number" && typeof pos.top === "number") return pos;
-    } catch (e) {
-    }
-    return null;
+    return loadPanelPos(BOOKMARK_PANEL_POS_KEY);
   }
-  // Persist bookmark-panel position {left,top} to localStorage.
   function saveBookmarkPanelPos(left, top) {
     if (shouldLog("verbose")) log("→ saveBookmarkPanelPos", traceArgs(arguments));
-    localStorage.setItem(BOOKMARK_PANEL_POS_KEY, JSON.stringify({ left, top }));
+    savePanelPos(BOOKMARK_PANEL_POS_KEY, left, top);
   }
-  // Apply the saved match-panel position to the element, clamping left/top to >=0 and clearing bottom so top-anchoring wins.
-  // No-op if no saved pos or no element.
+  // Apply the saved match-panel position (clears bottom so top-anchoring wins).
   function applyMatchPanelPos(panel2) {
     if (shouldLog("verbose")) log("→ applyMatchPanelPos", traceArgs(arguments));
-    const pos = loadMatchPanelPos();
-    if (!pos || !panel2) return;
-    panel2.style.left = `${Math.max(0, pos.left)}px`;
-    panel2.style.top = `${Math.max(0, pos.top)}px`;
-    panel2.style.bottom = "auto";
+    applyPanelPos(panel2, MATCH_PANEL_POS_KEY, { clearBottom: true });
   }
-  // Apply saved soft-panel position to the element (left/top clamped >=0), clearing right so left-anchoring wins.
+  // Apply saved soft-panel position (clears right so left-anchoring wins).
   function applySoftPanelPos(panel2) {
     if (shouldLog("verbose")) log("→ applySoftPanelPos", traceArgs(arguments));
-    const pos = loadSoftPanelPos();
-    if (!pos || !panel2) return;
-    panel2.style.left = `${Math.max(0, pos.left)}px`;
-    panel2.style.top = `${Math.max(0, pos.top)}px`;
-    panel2.style.right = "auto";
+    applyPanelPos(panel2, PANEL_POS_KEY, { clearRight: true });
   }
   // Set the soft panel's maxHeight to the space from its top to the viewport bottom minus 12px, floored at 240px.
   // Defaults to softPanelEl; reads layout via getBoundingClientRect.
@@ -2334,24 +2399,15 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     const available = Math.max(240, window.innerHeight - top - 12);
     panel2.style.maxHeight = `${available}px`;
   }
-  // Apply saved appointment-panel position (left/top clamped >=0), clearing both right and bottom.
+  // Apply saved appointment-panel position (clears both right and bottom).
   function applyApptPanelPos(panel2) {
     if (shouldLog("verbose")) log("→ applyApptPanelPos", traceArgs(arguments));
-    const pos = loadApptPanelPos();
-    if (!pos || !panel2) return;
-    panel2.style.left = `${Math.max(0, pos.left)}px`;
-    panel2.style.top = `${Math.max(0, pos.top)}px`;
-    panel2.style.right = "auto";
-    panel2.style.bottom = "auto";
+    applyPanelPos(panel2, APPT_PANEL_POS_KEY, { clearRight: true, clearBottom: true });
   }
-  // Apply saved bookmark-panel position (left/top clamped >=0), clearing right.
+  // Apply saved bookmark-panel position (clears right).
   function applyBookmarkPanelPos(panel2) {
     if (shouldLog("verbose")) log("→ applyBookmarkPanelPos", traceArgs(arguments));
-    const pos = loadBookmarkPanelPos();
-    if (!pos || !panel2) return;
-    panel2.style.left = `${Math.max(0, pos.left)}px`;
-    panel2.style.top = `${Math.max(0, pos.top)}px`;
-    panel2.style.right = "auto";
+    applyPanelPos(panel2, BOOKMARK_PANEL_POS_KEY, { clearRight: true });
   }
   // Wire pointer-drag on handle to move panel2; persists final position via saveFn (default saveMatchPanelPos) on release.
   // Ignores non-left-button presses and pointerdowns on interactive children (button/a/input/textarea/select/label).
@@ -2398,6 +2454,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Load persisted settings: return the first parseable value across STATE_KEYS (newest-first), else normalized DEFAULT_STATE.
   // Runs each candidate through normalizeLoadedState.
+  // Corrupt-storage handler shared by the persisted-state loaders: previously a JSON.parse failure
+  // was swallowed silently and the next save*() overwrote the corrupt-but-maybe-recoverable value
+  // with an empty default. Now the failure is logged unconditionally and the raw value is copied to
+  // "<key>.corrupt.<ts>" before the loader falls back, so nothing is silently destroyed.
+  function noteCorruptStorageKey(key, raw, err) {
+    try {
+      logError(`Corrupt JSON in localStorage key ${key} — falling back to defaults; raw value preserved`, err);
+      lsSetSafe(`${key}.corrupt.${Date.now()}`, String(raw).slice(0, 5e5));
+    } catch (e) {}
+  }
   function loadState() {
     if (shouldLog("verbose")) log("→ loadState", traceArgs(arguments));
     // Merge a raw object over DEFAULT_STATE and reconcile quick-phrase fields: split intro vs other messages, migrate legacy cannedMessages into intro, dedupe other against intro.
@@ -2435,6 +2501,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         try {
           return normalizeLoadedState(JSON.parse(raw));
         } catch (e) {
+          noteCorruptStorageKey(k, raw, e);
         }
       }
     }
@@ -2443,7 +2510,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Serialize the current state to the newest STATE_KEYS entry in localStorage.
   function saveState() {
     if (shouldLog("verbose")) log("→ saveState", traceArgs(arguments));
-    localStorage.setItem(STATE_KEYS[0], JSON.stringify(state));
+    refreshLogLevelCache();
+    lsSetSafe(STATE_KEYS[0], JSON.stringify(state));
   }
   // Load the blocked-profile id Set from the first valid array across BLOCKED_KEYS (newest-first), normalizing ids; empty Set if none.
   function loadBlockedSet() {
@@ -2455,6 +2523,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           const arr = JSON.parse(raw);
           if (Array.isArray(arr)) return new Set(normalizeIdList(arr));
         } catch (e) {
+          noteCorruptStorageKey(k, raw, e);
         }
       }
     }
@@ -2483,7 +2552,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function saveBlockedSet() {
     if (shouldLog("verbose")) log("→ saveBlockedSet", traceArgs(arguments));
     blocked = new Set(normalizeIdList([...blocked]));
-    localStorage.setItem(BLOCKED_KEYS[0], JSON.stringify([...blocked]));
+    lsSetSafe(BLOCKED_KEYS[0], JSON.stringify([...blocked]));
     scheduleDriveSync("blocked");
   }
   // Load the blocked-at-ms map (when each currently-blocked id was hidden), keyed by BLOCKED_AT_KEYS[0].
@@ -2505,6 +2574,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           }
         }
       } catch (e) {
+        noteCorruptStorageKey(BLOCKED_AT_KEYS[0], raw, e);
       }
     }
     for (const id of blocked) {
@@ -2519,7 +2589,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     for (const [id, ts] of blockedAt) {
       if (blocked.has(id)) obj[id] = ts;
     }
-    localStorage.setItem(BLOCKED_AT_KEYS[0], JSON.stringify(obj));
+    lsSetSafe(BLOCKED_AT_KEYS[0], JSON.stringify(obj));
   }
   // Normalize categories/tags: accept an array or a comma/newline-separated string; trim, case-insensitively dedupe, cap each to 40 chars and the list to 24 items.
   function normalizeTagValues(value) {
@@ -2552,21 +2622,27 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       for (const row of rows) {
         const id = normalizeProfileId((row == null ? void 0 : row.profileId) || (row == null ? void 0 : row.id));
         if (!id) continue;
-        map.set(id, {
-          profileId: id,
-          profileUrl: String((row == null ? void 0 : row.profileUrl) || profileUrlForId(id)),
-          profileLabel: String((row == null ? void 0 : row.profileLabel) || id.slice(0, 10)),
-          alias: String((row == null ? void 0 : row.alias) || "").trim().slice(0, 80),
-          categories: normalizeTagValues(row == null ? void 0 : row.categories),
-          tags: normalizeTagValues(row == null ? void 0 : row.tags),
-          lastSeenAt: parseTimestamp(row == null ? void 0 : row.lastSeenAt) || 0,
-          createdAt: parseTimestamp(row == null ? void 0 : row.createdAt) || now(),
-          updatedAt: parseTimestamp(row == null ? void 0 : row.updatedAt) || now()
-        });
+        map.set(id, normalizeBookmarkRow(id, row));
       }
     } catch (e) {
+      logError(`loadBookmarks: corrupt JSON in ${BOOKMARKS_KEY} — using empty set`, e);
     }
     return map;
+  }
+  // Single normalizer for a persisted/imported bookmark row (was copy-pasted in loadBookmarks,
+  // importData, and loadNotesFromGDrive — adding a bookmark field now means editing one place).
+  function normalizeBookmarkRow(id, row) {
+    return {
+      profileId: id,
+      profileUrl: String((row == null ? void 0 : row.profileUrl) || profileUrlForId(id)),
+      profileLabel: String((row == null ? void 0 : row.profileLabel) || id.slice(0, 10)),
+      alias: String((row == null ? void 0 : row.alias) || "").trim().slice(0, 80),
+      categories: normalizeTagValues(row == null ? void 0 : row.categories),
+      tags: normalizeTagValues(row == null ? void 0 : row.tags),
+      lastSeenAt: parseTimestamp(row == null ? void 0 : row.lastSeenAt) || 0,
+      createdAt: parseTimestamp(row == null ? void 0 : row.createdAt) || now(),
+      updatedAt: parseTimestamp(row == null ? void 0 : row.updatedAt) || now()
+    };
   }
   // Serialize the bookmarks Map (normalized fields, alias<=80 chars, capped at 2000 rows, id-less rows dropped) to localStorage.
   // Schedules a Drive sync unless sync=false.
@@ -2584,7 +2660,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       updatedAt: parseTimestamp(row == null ? void 0 : row.updatedAt) || now()
     // Bookmarks are capped at 2000 (2e3) rows on save; rows lacking a profileId are dropped first.
     })).filter((row) => !!row.profileId).slice(0, 2e3);
-    localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(rows));
+    lsSetSafe(BOOKMARKS_KEY, JSON.stringify(rows));
     if (sync) scheduleDriveSync("bookmarks");
   }
   // Return the icon-rules array from the first parseable value across ICON_RULES_KEYS (newest-first); empty array if none.
@@ -2595,28 +2671,30 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     for (const k of keys || []) {
       const raw = localStorage.getItem(k);
       if (!raw) continue;
-      try { return JSON.parse(raw); } catch (e) {}
+      try { return JSON.parse(raw); } catch (e) { noteCorruptStorageKey(k, raw, e); }
     }
     return undefined;
   }
   function loadIconRules() {
     if (shouldLog("verbose")) log("→ loadIconRules", traceArgs(arguments));
-    return readFirstParsedFromKeys(ICON_RULES_KEYS) || [];
-  }
-  // Persist the iconRules array to the newest ICON_RULES_KEYS entry.
-  function saveIconRules() {
-    if (shouldLog("verbose")) log("→ saveIconRules", traceArgs(arguments));
-    localStorage.setItem(ICON_RULES_KEYS[0], JSON.stringify(iconRules));
+    // Shape-guard: a non-array in this page-writable key would make `for (const rule of iconRules)`
+    // in inferAttitudeFromIcons throw "not iterable" — uncaught inside applyHiding's per-marker
+    // loop, killing the whole hide/show engine every 2s sweep.
+    const v = readFirstParsedFromKeys(ICON_RULES_KEYS);
+    return Array.isArray(v) ? v : [];
   }
   // Return the notes object from the first parseable value across NOTES_KEYS (newest-first); empty object if none.
   function loadNotes() {
     if (shouldLog("verbose")) log("→ loadNotes", traceArgs(arguments));
-    return readFirstParsedFromKeys(NOTES_KEYS) || {};
+    // Object-guard: a primitive/array value would make strict-mode `notes[id] = …` throw on the
+    // next saveNotes(). Only a plain object is a valid notes store.
+    const v = readFirstParsedFromKeys(NOTES_KEYS);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
   }
   // Persist notes to the newest NOTES_KEYS entry, then re-render the bookmark panel and schedule a Drive sync.
   function saveNotes() {
     if (shouldLog("verbose")) log("→ saveNotes", traceArgs(arguments));
-    localStorage.setItem(NOTES_KEYS[0], JSON.stringify(notes));
+    lsSetSafe(NOTES_KEYS[0], JSON.stringify(notes));
     renderBookmarkPanel();
     scheduleDriveSync("notes");
   }
@@ -2650,19 +2728,15 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist profileRatings to localStorage, then re-render the bookmark panel and schedule a Drive sync.
   function saveProfileRatings() {
     if (shouldLog("verbose")) log("→ saveProfileRatings", traceArgs(arguments));
-    localStorage.setItem(RATINGS_KEY, JSON.stringify(profileRatings));
+    lsSetSafe(RATINGS_KEY, JSON.stringify(profileRatings));
     renderBookmarkPanel();
     scheduleDriveSync("ratings");
   }
   // Return the manual-attitude overrides object from the first parseable value across MANUAL_ATT_KEYS (newest-first); empty object if none.
   function loadManualAttitudes() {
     if (shouldLog("verbose")) log("→ loadManualAttitudes", traceArgs(arguments));
-    return readFirstParsedFromKeys(MANUAL_ATT_KEYS) || {};
-  }
-  // Persist manualAttitudes to the newest MANUAL_ATT_KEYS entry.
-  function saveManualAttitudes() {
-    if (shouldLog("verbose")) log("→ saveManualAttitudes", traceArgs(arguments));
-    localStorage.setItem(MANUAL_ATT_KEYS[0], JSON.stringify(manualAttitudes));
+    const v = readFirstParsedFromKeys(MANUAL_ATT_KEYS);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
   }
   // Return the howdy-sent timestamp map from localStorage; empty object if missing, unparseable, or not an object.
   function loadHowdySentMap() {
@@ -2680,7 +2754,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist the per-profile 'howdy already sent' timestamp map to localStorage.
   function saveHowdySentMap() {
     if (shouldLog("verbose")) log("→ saveHowdySentMap", traceArgs(arguments));
-    localStorage.setItem(HOWDY_SENT_KEY, JSON.stringify(howdySentAt));
+    lsSetSafe(HOWDY_SENT_KEY, JSON.stringify(howdySentAt));
   }
   // Load the hide-event log; coerce each row to {id, ts}, dropping rows with no normalizable profile id.
   // Tolerates non-array/corrupt JSON by returning [].
@@ -2700,7 +2774,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function saveHideHistory() {
     if (shouldLog("verbose")) log("→ saveHideHistory", traceArgs(arguments));
     const trimmed = hideHistory.slice(-500);
-    localStorage.setItem(HIDE_HISTORY_KEY, JSON.stringify(trimmed));
+    lsSetSafe(HIDE_HISTORY_KEY, JSON.stringify(trimmed));
   }
   // Load the quick-phrase send history object; returns {} on missing/invalid JSON.
   function loadPhraseHistory() {
@@ -2717,7 +2791,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist the quick-phrase send history object to localStorage.
   function savePhraseHistory() {
     if (shouldLog("verbose")) log("→ savePhraseHistory", traceArgs(arguments));
-    localStorage.setItem(PHRASE_HISTORY_KEY, JSON.stringify(phraseHistory));
+    lsSetSafe(PHRASE_HISTORY_KEY, JSON.stringify(phraseHistory));
   }
   // Load quick-phrase usage stats object; returns {} on missing/invalid JSON.
   function loadPhraseStats() {
@@ -2734,7 +2808,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist quick-phrase usage stats object to localStorage.
   function savePhraseStats() {
     if (shouldLog("verbose")) log("→ savePhraseStats", traceArgs(arguments));
-    localStorage.setItem(PHRASE_STATS_KEY, JSON.stringify(phraseStats));
+    lsSetSafe(PHRASE_STATS_KEY, JSON.stringify(phraseStats));
   }
   // Load per-profile chat-deletion counters, re-keying by normalized id and dropping zero-count/idless rows.
   // Accepts both {count,...} objects and a bare numeric count for each id.
@@ -2776,7 +2850,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       };
     }
     chatDeletionStats = out;
-    localStorage.setItem(CHAT_DELETE_STATS_KEY, JSON.stringify(out));
+    lsSetSafe(CHAT_DELETE_STATS_KEY, JSON.stringify(out));
   }
   // Load the dedupe set of seen deletion-event fingerprints, dropping any older than CHAT_DELETE_RETENTION_MS (180 days).
   // Returns {} on missing/invalid JSON.
@@ -2801,7 +2875,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist the seen-deletion-event fingerprint->ts map to localStorage.
   function saveSeenChatDeletionEvents() {
     if (shouldLog("verbose")) log("→ saveSeenChatDeletionEvents", traceArgs(arguments));
-    localStorage.setItem(CHAT_DELETE_EVENTS_KEY, JSON.stringify(seenChatDeletionEvents || {}));
+    lsSetSafe(CHAT_DELETE_EVENTS_KEY, JSON.stringify(seenChatDeletionEvents || {}));
   }
   // Debounced flush of deletion stats + seen-events: coalesces bursts into one save after 250ms.
   // No-op if a save timer is already pending.
@@ -2866,7 +2940,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     const payload = {};
     for (const row of rows) payload[row.id] = row;
     pendingAutoMessages = payload;
-    localStorage.setItem(AUTO_MESSAGE_PENDING_KEY, JSON.stringify(payload));
+    lsSetSafe(AUTO_MESSAGE_PENDING_KEY, JSON.stringify(payload));
   }
   // Queue an auto-message for a profile (overwriting any prior one for that id) and persist immediately.
   // Returns the stored row, or null if id/phrase is empty.
@@ -2947,6 +3021,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         });
       }
     } catch (e) {
+      noteCorruptStorageKey(APPOINTMENTS_KEY, raw, e);
     }
     return map;
   }
@@ -2954,7 +3029,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function saveAppointments() {
     if (shouldLog("verbose")) log("→ saveAppointments", traceArgs(arguments));
     const arr = [...appointments.values()].sort((a, b) => (a.atTs || 0) - (b.atTs || 0)).slice(0, 800);
-    localStorage.setItem(APPOINTMENTS_KEY, JSON.stringify(arr));
+    lsSetSafe(APPOINTMENTS_KEY, JSON.stringify(arr));
   }
   // Extract the first run of 6+ hex chars from any value and lowercase it; returns null if none.
   // Extraction (not validation): pulls the id out of URLs/labels rather than requiring an exact match.
@@ -2963,6 +3038,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     // Matches the first run of 6+ hex chars anywhere in the string (extraction, not full-string validation).
     const m = String(v).match(/[0-9a-f]{6,}/i);
     return m ? m[0].toLowerCase() : null;
+  }
+  // Extract a profile id from a /profile/<hex> href (the pattern previously hand-rolled at 9 call
+  // sites). Returns the raw capture (caller decides whether to normalize) or null.
+  function profileIdFromHref(href) {
+    const m = String(href || "").match(/\/profile\/([0-9a-f]{6,})/i);
+    return m ? m[1] : null;
   }
   // Convert relative phrases ('now', 'today', 'yesterday', '5m ago', '3 days ago') to an absolute ms timestamp.
   // Months approximated as 30 days and years as 365 days; returns 0 if unrecognized.
@@ -2977,7 +3058,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (compact) {
       const count = Math.max(0, Number(compact[1]) || 0);
       const unit = String(compact[2] || "").toLowerCase();
-      // Unit->seconds multiplier; month approximated as 30 days and year as 365 days. Order matters: 'mo' is tested before bare 'm'/'min'.
+      // Unit->seconds multiplier; month approximated as 30 days and year as 365 days. Minute wins by
+      // EXACT match ('m' === or startsWith 'min') before the 'mo' prefix test, so 'mo'/'month' can
+      // never be swallowed by the minute branch.
       const secMult = unit.startsWith("s") ? 1 : unit === "m" || unit.startsWith("min") || unit.startsWith("minute") ? 60 : unit.startsWith("h") ? 3600 : unit.startsWith("d") ? 86400 : unit.startsWith("w") ? 7 * 86400 : unit.startsWith("mo") ? 30 * 86400 : unit.startsWith("y") || unit.startsWith("yr") ? 365 * 86400 : 0;
       if (secMult > 0) return nowTs - count * secMult * 1e3;
     }
@@ -3056,7 +3139,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist the self-profile-id Set as a JSON array to localStorage.
   function saveSelfProfileIds() {
     if (shouldLog("verbose")) log("→ saveSelfProfileIds", traceArgs(arguments));
-    localStorage.setItem(CHAT_SELF_IDS_KEY, JSON.stringify([...selfProfileIds]));
+    lsSetSafe(CHAT_SELF_IDS_KEY, JSON.stringify([...selfProfileIds]));
   }
   // Add a normalized id to the self-id set and persist, but only if new (skips the write when already present).
   function rememberSelfProfileId(id) {
@@ -3096,6 +3179,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         });
       }
     } catch (e) {
+      noteCorruptStorageKey(CHAT_ACTIVITY_KEY, raw, e);
     }
     return map;
   }
@@ -3118,7 +3202,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         updatedAt: parseTimestamp(entry.updatedAt) || 0
       };
     }
-    localStorage.setItem(CHAT_ACTIVITY_KEY, JSON.stringify(out));
+    lsSetSafe(CHAT_ACTIVITY_KEY, JSON.stringify(out));
   }
   // Debounced chat-activity flush: coalesces writes into one save after 250ms.
   // No-op if a save timer is already pending.
@@ -3250,10 +3334,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (!raw) return { windowStart: 0, count: 0, cooldownUntil: 0 };
     try {
       const r = JSON.parse(raw);
+      // Coerce + validate: a non-numeric stored field would make the cooldown math NaN, and
+      // `NaN <= 0` is false — permanently disabling all fetching while the pill reads "6/6".
+      const num = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+      };
       return {
-        windowStart: r.windowStart || 0,
-        count: r.count || 0,
-        cooldownUntil: r.cooldownUntil || 0
+        windowStart: num(r.windowStart),
+        count: num(r.count),
+        cooldownUntil: num(r.cooldownUntil)
       };
     } catch (e) {
       return { windowStart: 0, count: 0, cooldownUntil: 0 };
@@ -3262,7 +3352,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist the rate-limit record to localStorage.
   function saveRate(rate) {
     if (shouldLog("verbose")) log("→ saveRate", traceArgs(arguments));
-    localStorage.setItem(RATE_KEY, JSON.stringify(rate));
+    lsSetSafe(RATE_KEY, JSON.stringify(rate));
   }
   // Read the rate record, resetting the count when the 1-minute window has elapsed (persists the reset).
   // Returns {rate, cooldownMs, remaining} against MAX_REQUESTS_PER_MIN (6).
@@ -3292,10 +3382,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Refresh the rate-status pill text/'cooldown' class from the current rate snapshot.
   // No-ops if rateStatusEl isn't mounted; shows cooldown timer or remaining req/min budget.
-  function updateRateCounter() {
+  function updateRateCounter(precomputedSnap = null) {
     if (shouldLog("verbose")) log("→ updateRateCounter", traceArgs(arguments));
     if (!rateStatusEl) return;
-    const snap = getRateSnapshot();
+    const snap = precomputedSnap || getRateSnapshot();
     if (snap.cooldownMs > 0) {
       // \xB7 is a middot (·) separator in the status pill text.
       rateStatusEl.textContent = `API cooldown ${formatTimer(snap.cooldownMs)} \xB7 ${snap.remaining}/${MAX_REQUESTS_PER_MIN} req left`;
@@ -3310,7 +3400,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (shouldLog("verbose")) log("→ canRequest", traceArgs(arguments));
     const snap = getRateSnapshot();
     const allowed = snap.cooldownMs <= 0 && snap.remaining > 0;
-    updateRateCounter();
+    updateRateCounter(snap);
     return allowed;
   }
   // Record one API request against the rolling 60s window (resetting the window if expired) and persist.
@@ -3403,9 +3493,26 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Pick the smallest sensible on-screen rect to anchor a badge to, from the marker/root and inner avatar/container/profile-link candidates.
   // Ignores rects under 8px or outside the 64-25000 px area band; falls back to root/marker bounding rect.
+  // Chosen badge-anchor element per marker root, so the 8 querySelector probes + up-to-10 rect
+  // reads below run once per root instead of on every 2s sweep and every scroll/pan refresh. The
+  // cached anchor's rect is re-read fresh each call (position changes constantly; the ELEMENT
+  // choice doesn't). Entry drops with the node (WeakMap) or when the anchor leaves the DOM.
+  const markerAnchorElCache = /* @__PURE__ */ new WeakMap();
   function pickBestMarkerAnchorRect(marker, root) {
     if (shouldLog("verbose")) log("→ pickBestMarkerAnchorRect", traceArgs(arguments));
     var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
+    const cacheKey = root || marker;
+    if (cacheKey) {
+      const cachedAnchor = markerAnchorElCache.get(cacheKey);
+      if (cachedAnchor && cachedAnchor.isConnected) {
+        try {
+          const rect = cachedAnchor.getBoundingClientRect();
+          const area = rect.width * rect.height;
+          if (rect.width >= 8 && rect.height >= 8 && area >= 64 && area <= 25e3) return rect;
+        } catch (e) {}
+        markerAnchorElCache.delete(cacheKey);
+      }
+    }
     const seen = /* @__PURE__ */ new Set();
     const candidates = [];
     // Local helper of pickBestMarkerAnchorRect: add an Element to the candidate list, de-duped via the seen Set.
@@ -3427,6 +3534,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     push((_h = root == null ? void 0 : root.querySelector) == null ? void 0 : _h.call(root, "a[href*='/profile/']"));
     let bestRect = null;
     let bestArea = Number.POSITIVE_INFINITY;
+    let bestEl = null;
     for (const el of candidates) {
       let rect;
       try {
@@ -3441,9 +3549,13 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       if (area < bestArea) {
         bestArea = area;
         bestRect = rect;
+        bestEl = el;
       }
     }
-    if (bestRect) return bestRect;
+    if (bestRect) {
+      if (cacheKey && bestEl) markerAnchorElCache.set(cacheKey, bestEl);
+      return bestRect;
+    }
     try {
       return ((_i = root == null ? void 0 : root.getBoundingClientRect) == null ? void 0 : _i.call(root)) || ((_j = marker == null ? void 0 : marker.getBoundingClientRect) == null ? void 0 : _j.call(marker)) || null;
     } catch (e) {
@@ -3764,7 +3876,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     for (const el of candidates) {
       if (!(el instanceof Element)) continue;
-      if (el.closest(".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-panel, .sniffies-chat-phrases-launcher, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal")) {
+      if (el.closest(NAV_PANEL_SKIP_SELECTOR)) {
         continue;
       }
       const text = sanitizeMessageText(el.innerText || el.textContent || "");
@@ -3779,11 +3891,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     const clean = sanitizeMessageText(raw);
     if (clean.length < 2) return "";
     lastQuickPhraseCandidate = clean;
+    // sandboxOnly: captured clipboard/selection text must never be readable by page JS.
     exposeGlobal("__sniffiesLastQuickPhraseCandidate", {
       text: clean,
       source: String(source || "unknown"),
       ts: (/* @__PURE__ */ new Date()).toISOString()
-    });
+    }, { sandboxOnly: true });
     return clean;
   }
   // From a menu's text block, pick the longest 2-240 char line that isn't a UI action label (copy/react/reply/delete/etc).
@@ -3828,12 +3941,14 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     try {
       const clip = navigator.clipboard;
       if (clip && typeof clip.writeText === "function") {
+        const priorWriteText = clip.writeText;
         const originalWriteText = clip.writeText.bind(clip);
         // Monkey-patch: wraps clipboard.writeText to snoop copied text, then delegates to the original.
         clip.writeText = async function patchedClipboardWriteText(text) {
           rememberQuickPhraseCandidate(text, "clipboard.writeText");
           return originalWriteText(text);
         };
+        teardownRestorers.push(() => { clip.writeText = priorWriteText; quickPhraseCaptureHooksInstalled = false; });
       }
     } catch (e) {
     }
@@ -3851,6 +3966,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           }
           return out;
         };
+        teardownRestorers.push(() => { Document.prototype.execCommand = originalExecCommand; quickPhraseCaptureHooksInstalled = false; });
       }
     } catch (e) {
     }
@@ -4070,17 +4186,18 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (shouldLog("verbose")) log("→ bindChatPhraseContextMenuCloser", traceArgs(arguments));
     if (chatPhraseContextMenuCloserBound) return;
     chatPhraseContextMenuCloserBound = true;
-    document.addEventListener("pointerdown", (e) => {
+    // Tracked so teardownSniffies() removes them (were previously untracked and survived teardown).
+    addTrackedListener(document, "pointerdown", (e) => {
       if (!chatPhraseContextMenuEl) return;
       if (e.target instanceof Element && chatPhraseContextMenuEl.contains(e.target)) return;
       hideChatPhraseContextMenu();
     }, true);
-    document.addEventListener("scroll", () => {
+    addTrackedListener(document, "scroll", () => {
       if (chatPhraseContextMenuEl) hideChatPhraseContextMenu();
     }, { capture: true, passive: true });
-    window.addEventListener("blur", hideChatPhraseContextMenu, true);
-    window.addEventListener("resize", hideChatPhraseContextMenu, true);
-    document.addEventListener("keydown", (e) => {
+    addTrackedListener(window, "blur", hideChatPhraseContextMenu, true);
+    addTrackedListener(window, "resize", hideChatPhraseContextMenu, true);
+    addTrackedListener(document, "keydown", (e) => {
       if (e.key === "Escape") hideChatPhraseContextMenu();
     }, true);
   }
@@ -4142,28 +4259,34 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Positions the panel just left of the chat anchor, flipping to the right side if there is no room, then clamps within the viewport.
   // Clears right/bottom so left/top take effect.
-  function positionChatPhrasePanel(panel2) {
-    if (shouldLog("verbose")) log("→ positionChatPhrasePanel", traceArgs(arguments));
-    if (!panel2) return;
+  // Shared anchor-flip-clamp placement for the quick-phrase panel and its launcher (was duplicated
+  // with two silent divergences). minW/minH are size floors for unmeasured elements; topOffset is
+  // the vertical nudge relative to the anchor top (panel: 0, launcher: +6 so it clears the input).
+  function placeBesideChatAnchor(el, { minW, minH, topOffset = 0 }) {
+    if (!el) return;
     const anchor = getChatPhraseAnchorRect();
-    const panelWidth = Math.max(panel2.offsetWidth || panel2.getBoundingClientRect().width || 0, 180);
-    const panelHeight = Math.max(panel2.offsetHeight || panel2.getBoundingClientRect().height || 0, 120);
+    const width = Math.max(el.offsetWidth || el.getBoundingClientRect().width || 0, minW);
+    const height = Math.max(el.offsetHeight || el.getBoundingClientRect().height || 0, minH);
     let left = 10;
     let top = 96;
     if (anchor) {
-      left = Math.round(anchor.left - panelWidth - 10);
+      left = Math.round(anchor.left - width - 10);
       if (left < 8) {
         const rightCandidate = Math.round(anchor.right + 10);
-        left = rightCandidate + panelWidth <= window.innerWidth - 8 ? rightCandidate : 8;
+        left = rightCandidate + width <= window.innerWidth - 8 ? rightCandidate : 8;
       }
-      top = Math.round(anchor.top);
+      top = Math.round(anchor.top + topOffset);
     }
-    left = Math.max(8, Math.min(left, Math.max(8, window.innerWidth - panelWidth - 8)));
-    top = Math.max(8, Math.min(top, Math.max(8, window.innerHeight - panelHeight - 8)));
-    panel2.style.left = `${left}px`;
-    panel2.style.top = `${top}px`;
-    panel2.style.right = "auto";
-    panel2.style.bottom = "auto";
+    left = Math.max(8, Math.min(left, Math.max(8, window.innerWidth - width - 8)));
+    top = Math.max(8, Math.min(top, Math.max(8, window.innerHeight - height - 8)));
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.style.right = "auto";
+    el.style.bottom = "auto";
+  }
+  function positionChatPhrasePanel(panel2) {
+    if (shouldLog("verbose")) log("→ positionChatPhrasePanel", traceArgs(arguments));
+    placeBesideChatAnchor(panel2, { minW: 180, minH: 120, topOffset: 0 });
   }
   // Creates (or returns the cached) 'Quick Phrases' launcher button that opens the panel on click; appends to body and caches in chatPhraseLauncherEl.
   function buildChatPhraseLauncher() {
@@ -4182,26 +4305,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Positions the collapsed launcher button beside the chat anchor (left, flipping right if cramped), clamped to the viewport.
   function positionChatPhraseLauncher(launcher) {
     if (shouldLog("verbose")) log("→ positionChatPhraseLauncher", traceArgs(arguments));
-    if (!launcher) return;
-    const anchor = getChatPhraseAnchorRect();
-    const width = Math.max(launcher.offsetWidth || launcher.getBoundingClientRect().width || 0, 84);
-    const height = Math.max(launcher.offsetHeight || launcher.getBoundingClientRect().height || 0, 30);
-    let left = 10;
-    let top = 96;
-    if (anchor) {
-      left = Math.round(anchor.left - width - 10);
-      if (left < 8) {
-        const rightCandidate = Math.round(anchor.right + 10);
-        left = rightCandidate + width <= window.innerWidth - 8 ? rightCandidate : 8;
-      }
-      top = Math.round(anchor.top + 6);
-    }
-    left = Math.max(8, Math.min(left, Math.max(8, window.innerWidth - width - 8)));
-    top = Math.max(8, Math.min(top, Math.max(8, window.innerHeight - height - 8)));
-    launcher.style.left = `${left}px`;
-    launcher.style.top = `${top}px`;
-    launcher.style.right = "auto";
-    launcher.style.bottom = "auto";
+    placeBesideChatAnchor(launcher, { minW: 84, minH: 30, topOffset: 6 });
   }
   // Sets state.showChatPhrasePanel, optionally persists via saveState, then re-renders the panel.
   function setChatPhrasePanelVisible(visible, persist = true) {
@@ -4364,13 +4468,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     return "";
   }
-  // Escapes &, <, >, " and ' for safe HTML interpolation.
-  function escapeHtml(s) {
-    if (shouldLog("verbose")) log("→ escapeHtml", traceArgs(arguments));
-    // Order matters: & is escaped first so the &-entities introduced by later replacements are not double-escaped.
-    return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#39;");
-  }
   // Normalizes a profile id from a string/number, or from common id fields of an object (profileId/userId/cruiserId/id/_id, plus nested user._id / profile._id).
+  // (escapeHtml was removed as dead code: every innerHTML site in this file is a static literal and
+  // all dynamic DOM text goes through textContent/createElement.)
   function extractIdCandidate(value) {
     if (shouldLog("verbose")) log("→ extractIdCandidate", traceArgs(arguments));
     var _a, _b;
@@ -4700,19 +4800,25 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       "lastChatAt",
       "latestMessageAt"
     ];
+    const nowTs = now();
     for (const key of priority) {
       if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
       const ts = parseTimestamp(obj[key]);
-      if (ts) return ts;
+      // Clamp: a future message time is never legitimate and, once merged max-wins, is permanent.
+      if (ts > 0 && ts <= nowTs) return ts;
     }
     let latest = 0;
     for (const [key, value] of Object.entries(obj)) {
       const normalizedKey = normalizeKey(key);
       // Only treat keys ending in a real timestamp suffix as a fallback time. The previous bare `at|ts$`
       // matched unrelated words (seat, format, chat, stats, candidate), letting a stray number become the time.
-      if (!/(time|date|timestamp)$|(created|sent|received|delivered|read|seen|edited|deleted|removed|retracted|unsent|posted|modified|message|chat|event|activity|expire|expires|expired)(at|ts)$/.test(normalizedKey)) continue;
+      // `expire*` is deliberately EXCLUDED: a disappearing-message / media expiry is a FUTURE time, not
+      // when the message happened — and since chat-activity merges max-wins, a future value can never be
+      // lowered and would mis-hide the profile until it passes.
+      if (!/(time|date|timestamp)$|(created|sent|received|delivered|read|seen|edited|deleted|removed|retracted|unsent|posted|modified|message|chat|event|activity)(at|ts)$/.test(normalizedKey)) continue;
       const ts = parseTimestamp(value);
-      if (ts > latest) latest = ts;
+      // Clamp to now(): a future message timestamp is never legitimate and, once merged, is permanent.
+      if (ts > 0 && ts <= nowTs && ts > latest) latest = ts;
     }
     return latest;
   }
@@ -4845,7 +4951,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     for (const [key, value] of Object.entries(obj)) {
       const normalizedKey = normalizeKey(key);
       if (/(deletedat|removedat|retractedat|unsentat)/.test(normalizedKey) && parseTimestamp(value)) return true;
-      if (/(deleted|isdeleted|removed|isremoved|retracted|isretracted|unsent|isunsent|messageDeleted)/.test(normalizedKey)) {
+      if (/(deleted|isdeleted|removed|isremoved|retracted|isretracted|unsent|isunsent)/.test(normalizedKey)) {
         if (value === true || value === 1 || value === "1") return true;
         if (typeof value === "string" && /^(true|deleted|removed|retracted|unsent)$/i.test(value.trim())) return true;
       }
@@ -5048,12 +5154,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     return { scanned, parsed, updates };
   }
   // Scan both localStorage and sessionStorage for chat payloads, aggregate the counts, and report updates.
-  // Self-throttled to once per 1200ms via chatStorageScanTimer unless force=true; mutates chatCaptureStats and calls noteChatPayloadUpdates.
+  // Self-throttled to once per 1200ms via chatStorageScanNextAt unless force=true; mutates chatCaptureStats and calls noteChatPayloadUpdates.
   function scanStorageForChatPayloads(reason = "interval", force = false) {
     if (shouldLog("verbose")) log("→ scanStorageForChatPayloads", traceArgs(arguments));
     const nowTs = now();
-    if (!force && chatStorageScanTimer && nowTs < chatStorageScanTimer) return { scanned: 0, parsed: 0, updates: 0 };
-    chatStorageScanTimer = nowTs + 1200;
+    if (!force && chatStorageScanNextAt && nowTs < chatStorageScanNextAt) return { scanned: 0, parsed: 0, updates: 0 };
+    chatStorageScanNextAt = nowTs + 1200;
     let local = { scanned: 0, parsed: 0, updates: 0 };
     let session = { scanned: 0, parsed: 0, updates: 0 };
     try {
@@ -5133,8 +5239,18 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     let updates = 0;
     const seen = /* @__PURE__ */ new WeakSet();
     const queue = [{ value: payload, contextProfileId: normalizeProfileId(initialContextProfileId), depth: 0 }];
-    while (queue.length) {
-      const { value, contextProfileId, depth } = queue.shift();
+    // Read-cursor dequeue (shift() is O(n) per element → O(n²) over the queue), plus a hard node
+    // budget: the depth cap alone doesn't bound WIDE payloads, and this walk runs synchronously on
+    // the main thread for every captured frame/response.
+    let head = 0;
+    let visited = 0;
+    const NODE_BUDGET = 5e3;
+    while (head < queue.length) {
+      if (++visited > NODE_BUDGET) {
+        logWarn(`consumeChatPayload: node budget (${NODE_BUDGET}) exceeded — payload walk truncated`);
+        break;
+      }
+      const { value, contextProfileId, depth } = queue[head++];
       if (!value || typeof value !== "object") continue;
       if (seen.has(value)) continue;
       seen.add(value);
@@ -5265,6 +5381,11 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
             chatCaptureStats.apiJsonSeen += 1;
             const ct = String(((_b = res.headers) == null ? void 0 : _b.get("content-type")) || "").toLowerCase();
             if (!ct.includes("json")) return res;
+            // Match the XHR/WS paths' ~1.5MB body cap: a huge non-chat response must not drive an
+            // unbounded synchronous BFS on the main thread (content-length absent → allow, BFS
+            // node budget in consumeChatPayload is the backstop).
+            const clen = Number(((_b = res.headers) == null ? void 0 : _b.get("content-length")) || 0);
+            if (clen > 15e5) return res;
             // Clone before reading JSON so the page still consumes the original response body. Mark the CLONE as
             // already-seen so the patched Response.prototype.json (invoked by the clone's .json()) does NOT capture
             // it a second time — capture must run exactly once per response.
@@ -5285,6 +5406,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         };
         wrappedFetch.__sniffiesChatWrapped = true;
         targetWindow.fetch = wrappedFetch;
+        teardownRestorers.push(() => {
+          try { if (targetWindow.fetch === wrappedFetch) targetWindow.fetch = originalFetch; } catch (e) {}
+          try { delete targetWindow.__sniffiesChatCapturePatched; } catch (e) {}
+        });
         patched = true;
       }
     } catch (e) {
@@ -5317,6 +5442,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
             });
           };
           ResponseCtor.prototype.__sniffiesChatPatchedJson = true;
+          teardownRestorers.push(() => {
+            try { ResponseCtor.prototype.json = originalJson; delete ResponseCtor.prototype.__sniffiesChatPatchedJson; } catch (e) {}
+          });
           patched = true;
         }
       }
@@ -5359,6 +5487,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           return originalSend.apply(this, arguments);
         };
         XHR.prototype.__sniffiesChatPatched = true;
+        teardownRestorers.push(() => {
+          try { XHR.prototype.open = originalOpen; XHR.prototype.send = originalSend; delete XHR.prototype.__sniffiesChatPatched; } catch (e) {}
+        });
         patched = true;
       }
     } catch (e) {
@@ -5385,6 +5516,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         });
         try { NativeWebSocket.__sniffiesChatPatched = true; } catch (e) {}
         targetWindow.WebSocket = WrappedWebSocket;
+        teardownRestorers.push(() => {
+          try { if (targetWindow.WebSocket === WrappedWebSocket) targetWindow.WebSocket = NativeWebSocket; } catch (e) {}
+          try { delete NativeWebSocket.__sniffiesChatPatched; } catch (e) {}
+        });
         wrappedConstructor = true;
         patched = true;
       }
@@ -5401,6 +5536,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
             return originalDispatch.apply(this, arguments);
           };
           wsProto.__sniffiesChatDispatchPatched = true;
+          teardownRestorers.push(() => {
+            try { wsProto.dispatchEvent = originalDispatch; delete wsProto.__sniffiesChatDispatchPatched; } catch (e) {}
+          });
           patched = true;
         }
       }
@@ -5438,6 +5576,11 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     chatCaptureInstalled = patchedCount > 0;
     if (!chatCaptureInstalled) {
       logWarn("Chat capture patch not applied");
+    } else if (targets.length < 2) {
+      // Distinct from full success: only the sandbox realm was reachable (no unsafeWindow, or it
+      // aliases window under SES). Under Firefox/Greasemonkey Xray wrappers a sandbox-only patch
+      // can succeed while page code keeps the untouched page globals — capture then never fires.
+      logWarn("Chat capture patched on sandbox realm only — if the site's own traffic bypasses it (Xray wrappers), chat-activity capture will not observe page requests");
     }
     scanStorageForChatPayloads("install", true);
   }
@@ -5462,7 +5605,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function resolveMarkerRoot(el) {
     if (shouldLog("verbose")) log("→ resolveMarkerRoot", traceArgs(arguments));
     if (!el) return null;
-    return el.closest(".maplibregl-marker") || el.closest(".marker-avatar") || el.closest("[data-testid='cv-marker']") || el.parentElement || el;
+    // Note: the live DOM's testids are cv-marker-container / cv-marker-avatar-image; the legacy
+    // bare 'cv-marker' selector never matched anything in the observed snapshot but is kept last
+    // as a harmless fallback for older builds.
+    return el.closest(".maplibregl-marker") || el.closest(".marker-avatar") || el.closest("[data-testid='cv-marker-container']") || el.closest("[data-testid='cv-marker']") || el.parentElement || el;
   }
   // Resolve the profile id for a map-marker element via a fallback chain: profile-link href, then data-* attrs, then avatar background-image, then ancestor bg, then marker-container id.
   // Returns null if no strategy yields an id; tolerant of the Angular/MapLibre DOM where markers carry no stable id attribute.
@@ -5588,17 +5734,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     return count;
   }
-  // Record a user-assigned attitude override for a profile id, persist it, and prime the attitude cache.
-  // Side effects: mutates manualAttitudes, calls saveManualAttitudes (localStorage), and seeds attitudeCache with a fresh timestamp.
-  function setManualAttitude(id, att) {
-    if (shouldLog("verbose")) log("→ setManualAttitude", traceArgs(arguments));
-    if (!id) return;
-    const norm = normalizeAttitude(att);
-    if (!norm) return;
-    manualAttitudes[id] = norm;
-    saveManualAttitudes();
-    attitudeCache.set(id, { attitude: norm, ts: now() });
-  }
+  // (setManualAttitude/saveManualAttitudes were removed as dead code: manualAttitudes is read-only
+  // at runtime — populated solely by loadManualAttitudes() from localStorage.)
   // Build the canonical sniffies.com profile URL for a given id.
   function profileHref(id) {
     if (shouldLog("verbose")) log("→ profileHref", traceArgs(arguments));
@@ -6048,12 +6185,18 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           noteRateLimit();
           return null;
         }
-        if (!res.ok) continue;
+        if (!res.ok) {
+          // Every external call logs its outcome; 401/403 means auth is gone — re-probing other
+          // bases with the same cookies only multiplies credentialed failures, so stop.
+          logWarn("fetchFullUser non-OK", { base, status: res.status });
+          if (res.status === 401 || res.status === 403) return null;
+          continue;
+        }
         const data = await res.json();
         if (data && typeof data === "object") {
           preferredFullBase = base;
           // Remember the working full-user origin so future fetches try the last-known-good base first.
-          localStorage.setItem(FULL_BASE_KEY, base);
+          lsSetSafe(FULL_BASE_KEY, base);
           return data;
         }
       } catch (e) {
@@ -6093,17 +6236,21 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
             noteRateLimit();
             return [];
           }
-          if (!res.ok) continue;
+          if (!res.ok) {
+            logWarn("fetchPartials non-OK", { base, key, status: res.status });
+            if (res.status === 401 || res.status === 403) return [];
+            continue;
+          }
           const data = await res.json();
           if (Array.isArray(data)) {
             preferredMode = key;
             preferredBase = base;
-            localStorage.setItem(MODE_KEY, preferredMode);
-            localStorage.setItem(BASE_KEY, preferredBase);
+            lsSetSafe(MODE_KEY, preferredMode);
+            lsSetSafe(BASE_KEY, preferredBase);
             const fullBase = getOriginFromUrl(base);
             if (fullBase) {
               preferredFullBase = fullBase;
-              localStorage.setItem(FULL_BASE_KEY, fullBase);
+              lsSetSafe(FULL_BASE_KEY, fullBase);
             }
             return data;
           }
@@ -6176,7 +6323,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     fullProfileFetchInFlight.add(candidateId);
     try {
       const fullUser = await fetchFullUser(candidateId);
-      exposeGlobal("__sniffiesLastFullUserSample", fullUser || null);
+      exposeGlobal("__sniffiesLastFullUserSample", fullUser || null, { sandboxOnly: true });
       if (!fullUser || typeof fullUser !== "object") {
         profileTextRetryAt.set(candidateId, now() + PROFILE_TEXT_FULL_RETRY_MS);
         return 0;
@@ -6215,52 +6362,76 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Indexes on-screen markers into idToMarker by extracting profile ids from avatar bg, marker containers, and profile links.
   // Falls back to map hit-testing when no id is found; collects ids needing attitude refresh and marks bookmarks seen.
+  // Last id each marker root resolved to (WeakMap: entries die with their DOM nodes). Lets a scan
+  // pass reuse a root's id while the map hit-test fallback is throttled — see scanMarkers.
+  const markerRootLastId = /* @__PURE__ */ new WeakMap();
+  // Per-sweep chat-interaction-timestamp memo (see getLastAnyChatInteractionTs). Active ONLY while
+  // an applyHiding() pass is running — outside a sweep (event handlers, tests) reads stay fresh.
+  const chatInteractionTsMemo = /* @__PURE__ */ new Map();
+  let chatInteractionTsMemoActive = false;
+  // Memoized inferAttitudeFromIcons results per marker root (~4 style resolutions per descendant
+  // otherwise re-run every 2s for markers whose partials return attitude:null). 60s TTL.
+  const inferredAttitudeMemo = /* @__PURE__ */ new WeakMap();
+  const INFERRED_ATTITUDE_TTL_MS = 60 * 1e3;
   function scanMarkers() {
     if (shouldLog("verbose")) log("→ scanMarkers", traceArgs(arguments));
-    const markerImages = Array.from(document.querySelectorAll(".marker-avatar-image"));
-    const markerContainers = Array.from(document.querySelectorAll(".maplibregl-marker"));
-    const profileLinks = Array.from(document.querySelectorAll("a[href*='/profile/']"));
+    const markerImages = document.querySelectorAll(".marker-avatar-image");
+    const markerContainers = document.querySelectorAll(".maplibregl-marker");
+    const profileLinks = document.querySelectorAll("a[href*='/profile/']");
     const allMarkers = /* @__PURE__ */ new Map();
     const ids = [];
+    // Single ingestion point for the normalized keyspace: extractors return raw attribute values /
+    // case-preserving regex captures, but `blocked`, `chatActivity`, `bookmarks` etc. are all keyed
+    // by normalizeProfileId() — a raw uppercase-hex key here would silently bypass blocked.has().
+    const normId = (raw) => normalizeProfileId(raw) || null;
     for (const m of markerImages) {
-      let id = extractIdFromBg(getBg(m));
-      if (!id) id = tryIdFromMapForMarker(m);
-      if (!id) continue;
       const root = resolveMarkerRoot(m);
+      let id = normId(extractIdFromBg(getBg(m)));
+      // Last-known-id cache: when the cheap extractors miss and the hit-test fallback is inside its
+      // 10s throttle window, reuse the id this root resolved to last time instead of dropping the
+      // marker from idToMarker (which used to flash blocked profiles visible between hit-tests).
+      if (!id && root) id = markerRootLastId.get(root) || null;
+      if (!id) id = normId(tryIdFromMapForMarker(m));
+      if (!id) continue;
       if (root) {
         allMarkers.set(id, root);
+        markerRootLastId.set(root, id);
         const entry = attitudeCache.get(id);
         if (needsRefresh(entry)) ids.push(id);
       }
     }
     for (const container of markerContainers) {
-      let id = getMarkerIdFromElement(container);
+      let id = normId(getMarkerIdFromElement(container));
       if (id && allMarkers.has(id)) continue;
       if (!id) {
         const link = container.querySelector("a[href*='/profile/']");
         if (link) {
           const href = link.getAttribute("href") || "";
-          const m = href.match(/\/profile\/([0-9a-f]{6,})/i);
-          if (m) id = m[1];
+          id = normId(profileIdFromHref(href));
         }
       }
+      if (!id) id = markerRootLastId.get(container) || null;
       if (!id) {
         // Throttled fallback (per-marker cooldown via markerAttemptTs) — matches the markerImages loop
         // above, so a container that can't resolve via link/data-attr doesn't re-run the costly
         // map.queryRenderedFeatures hit-test on every scan cycle.
-        id = tryIdFromMapForMarker(container);
+        id = normId(tryIdFromMapForMarker(container));
       }
       if (id) {
         allMarkers.set(id, container);
+        markerRootLastId.set(container, id);
         const entry = attitudeCache.get(id);
         if (needsRefresh(entry)) ids.push(id);
       }
     }
     for (const link of profileLinks) {
+      // Skip the script's own panel links (bookmarks/matches/appointments): indexing an off-map
+      // profile with a panel div as its "marker" made getBookmarkOnlineState report it "online",
+      // persisted bogus lastSeenAt stamps, and let applyHiding put HIDE_CLASS on the panel's own row.
+      if (link.closest(NAV_PANEL_SKIP_SELECTOR)) continue;
       const href = link.getAttribute("href") || "";
-      const m = href.match(/\/profile\/([0-9a-f]{6,})/i);
-      if (!m) continue;
-      const id = m[1];
+      const id = normId(profileIdFromHref(href));
+      if (!id) continue;
       if (allMarkers.has(id)) continue;
       const markerParent = link.closest(".maplibregl-marker") || link.closest("[class*='marker']") || link.parentElement;
       if (markerParent) {
@@ -6282,6 +6453,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Otherwise shows the marker, applies text/attitude highlights, updates its chat badge; refreshes match panel and filter launchers.
   function applyHiding(alreadyScanned) {
     if (shouldLog("verbose")) log("→ applyHiding", traceArgs(arguments));
+    // Fresh chat-timestamp memo per sweep (see getLastAnyChatInteractionTs); deactivated on every
+    // exit path so out-of-sweep reads are never served stale values.
+    chatInteractionTsMemo.clear();
+    chatInteractionTsMemoActive = true;
     // Callers that just ran scanMarkers() synchronously (e.g. hideNow) pass true to skip the redundant re-scan.
     // The async paths (updatePartials batch loop, scheduleMapRefresh) keep the default re-scan: the DOM can change
     // across their await/timer boundaries, so re-scanning there is intentional, not redundant.
@@ -6304,12 +6479,21 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       updateAttitudeFilterLaunchers();
       applyGlobalChatHiding();
       ensureGlobalChatHideObserver();
+      chatInteractionTsMemoActive = false;
       return;
     }
-    // Defensive de-stick: clear HIDE_CLASS from every element currently carrying it, then re-apply it below in the
-    // SAME synchronous pass (no repaint between, so no flicker). Prevents a marker getting permanently stuck hidden
-    // when scanMarkers remaps an id to a different element while the old node still carries the class.
-    for (const staleHidden of document.querySelectorAll("." + HIDE_CLASS)) staleHidden.classList.remove(HIDE_CLASS);
+    // De-stick strategy (reconcile, not blanket-clear): the old blanket clear-then-re-add unhid a
+    // blocked marker on every pass where its id could not be re-resolved — the map hit-test fallback
+    // is throttled to once per MAP_MARKER_RETRY_MS (10s), so a blocked profile flashed visible for
+    // up to 10s at a time, ~4 of every 5 sweeps. Now: hide decisions run first, tracking every root
+    // hidden THIS pass; afterwards HIDE_CLASS is removed only from stale roots that no still-indexed
+    // marker resolves to. A marker missing from idToMarker this pass keeps its class.
+    const hiddenRoots = /* @__PURE__ */ new Set();
+    const hideMarkerTracked = (el) => {
+      hideMarker(el);
+      const root = resolveMarkerRoot(el);
+      if (root) hiddenRoots.add(root);
+    };
     // Markers that stay visible; their chat-badge layout reads run in a second pass below (see note) to avoid thrash.
     const pendingBadgeUpdates = [];
     for (const [id, marker] of idToMarker.entries()) {
@@ -6319,56 +6503,64 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       }
       unhighlightMarker(marker);
       if (blocked.has(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByProfileTerms(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByRecentChats(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByRecentChats2h(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByAnyChats(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByMissingChatHistory(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByNotOnlineWindow(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByRepeatedDelete(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       if (shouldHideByUnansweredOut(id)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
         continue;
       }
       const manual = manualAttitudes[id];
       const cache = attitudeCache.get(id);
       let att = manual || (cache == null ? void 0 : cache.attitude) || null;
-      if (!att) att = inferAttitudeFromIcons(marker);
+      if (!att) {
+        const memo = inferredAttitudeMemo.get(marker);
+        if (memo && now() - memo.ts < INFERRED_ATTITUDE_TTL_MS) {
+          att = memo.att;
+        } else {
+          att = inferAttitudeFromIcons(marker);
+          inferredAttitudeMemo.set(marker, { att, ts: now() });
+        }
+      }
       if (shouldHideAttitude(att)) {
-        hideMarker(marker);
+        hideMarkerTracked(marker);
         hideAllFloatingChatBadgesForId(id);
       } else {
         showMarker(marker);
@@ -6377,6 +6569,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         pendingBadgeUpdates.push([id, marker]);
       }
       ensureMarkerHoverBindings(id, marker);
+    }
+    // Reconcile pass (replaces the old blanket clear): drop HIDE_CLASS only from elements that are
+    // not the root of a marker hidden THIS pass and not the last-known root of any indexed marker —
+    // i.e. genuinely stale nodes left behind when scanMarkers remapped an id to a new element.
+    for (const el of document.querySelectorAll(HIDE_CLASS_SELECTOR)) {
+      if (hiddenRoots.has(el)) continue;
+      // A root that still maps to a known id stays hidden even when this pass could not re-resolve
+      // it (hit-test throttle): its verdict from the last resolvable pass stands.
+      if (markerRootLastId.has(el) && idToMarker.has(markerRootLastId.get(el))) continue;
+      el.classList.remove(HIDE_CLASS);
     }
     // Second pass: badge positioning reads layout (getComputedStyle/getBoundingClientRect); running it after all
     // hide/show class writes above prevents per-marker read-write layout thrash on this hot path (~2s interval).
@@ -6390,21 +6592,79 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     updateAttitudeFilterLaunchers();
     applyGlobalChatHiding();
     ensureGlobalChatHideObserver();
+    chatInteractionTsMemoActive = false;
   }
   // Boot-registered timers and top-level observers, tracked so teardownSniffies() can stop all background work
   // (e.g. on a runtime hand-off). Deliberately NOT auto-wired to pagehide — that would break bfcache restores;
   // call it manually via the __sniffiesTeardown debug global if a newer runtime takes over the tab.
   const bootTimers = [];
   const bootObservers = [];
+  // Document/window listeners registered via addTrackedListener are removed by teardownSniffies()
+  // with the exact capture flag they were added with.
+  const bootListeners = [];
+  // `opts` is a boolean capture flag or an options object; removeEventListener only needs the
+  // capture flag to match, so that's what's stored for teardown.
+  function addTrackedListener(target, type, handler, opts) {
+    const capture = typeof opts === "object" && opts !== null ? !!opts.capture : !!opts;
+    target.addEventListener(type, handler, opts);
+    bootListeners.push({ target, type, handler, capture });
+  }
+  // Monkey-patched page/realm intrinsics (fetch, Response.prototype.json, XHR, WebSocket,
+  // execCommand, clipboard.writeText) register an undo closure here at patch time so teardown can
+  // restore the realm instead of leaving orphaned patches funnelling into a dead closure.
+  const teardownRestorers = [];
   function teardownSniffies() {
     const timers = bootTimers.splice(0), observers = bootObservers.splice(0);
     for (const t of timers) { try { clearInterval(t); } catch (e) {} }
+    for (const t of timers) { try { clearTimeout(t); } catch (e) {} }
     for (const o of observers) { try { o.disconnect(); } catch (e) {} }
     try { if (globalChatHideObserver) globalChatHideObserver.disconnect(); } catch (e) {}
     try { if (profileContainerObserver) profileContainerObserver.disconnect(); } catch (e) {}
     try { window.removeEventListener("scroll", scheduleChatBadgeRefresh, { capture: true }); } catch (e) {}
     try { window.removeEventListener("resize", scheduleChatBadgeRefresh); } catch (e) {}
-    return { timersCleared: timers.length, observersDisconnected: observers.length };
+    // Stop the broadcast loop (was left opening tabs/queueing messages after teardown).
+    try { stopBroadcastMessage("teardown"); } catch (e) {}
+    // Clear the debounce/one-shot handles created outside bootTimers.
+    try { if (gdriveSyncTimer) { clearTimeout(gdriveSyncTimer); gdriveSyncTimer = 0; } } catch (e) {}
+    try { if (pendingRefreshTimer) { clearTimeout(pendingRefreshTimer); pendingRefreshTimer = 0; } } catch (e) {}
+    try { if (chatBadgeRefreshTimer) { clearTimeout(chatBadgeRefreshTimer); chatBadgeRefreshTimer = 0; } } catch (e) {}
+    try { if (profileRefreshTimer) { clearTimeout(profileRefreshTimer); profileRefreshTimer = 0; } } catch (e) {}
+    try { if (chatSaveTimer) { clearTimeout(chatSaveTimer); chatSaveTimer = 0; } } catch (e) {}
+    try { if (chatDeletionSaveTimer) { clearTimeout(chatDeletionSaveTimer); chatDeletionSaveTimer = 0; } } catch (e) {}
+    try { if (bookmarkSaveTimer) { clearTimeout(bookmarkSaveTimer); bookmarkSaveTimer = 0; } } catch (e) {}
+    // Remove the script's own DOM: its panels/launchers carry element-scoped click handlers that
+    // would otherwise keep firing hideNow/save from this now-dead closure while a successor runtime
+    // appends duplicate UI. Float badges go too. (The injected <style> is CSS-only with no handlers,
+    // and a successor re-injects harmlessly, so it is left in place.)
+    const ownNodes = [
+      softPanelEl, softPanelLauncherEl, softPanelRecentFilterEl, softPanelAnyChatFilterEl,
+      softPanelOnline2hFilterEl, softPanelGlobalChatFilterEl, matchPanelEl, appointmentPanelEl,
+      bookmarkPanelEl, chatPhrasePanelEl, chatPhraseLauncherEl, chatPhraseContextMenuEl,
+      ...softPanelAttitudeFilterEls.values(),
+      ...floatingChatBadges.values(),
+    ];
+    for (const n of ownNodes) { try { if (n && n.remove) n.remove(); } catch (e) {} }
+    try { softPanelEl = softPanelLauncherEl = softPanelRecentFilterEl = softPanelAnyChatFilterEl = softPanelOnline2hFilterEl = softPanelGlobalChatFilterEl = matchPanelEl = appointmentPanelEl = bookmarkPanelEl = chatPhrasePanelEl = chatPhraseLauncherEl = null; } catch (e) {}
+    try { softPanelAttitudeFilterEls.clear(); floatingChatBadges.clear(); } catch (e) {}
+    // Remove every tracked document/window listener with its original capture flag.
+    const listeners = bootListeners.splice(0);
+    for (const l of listeners) { try { l.target.removeEventListener(l.type, l.handler, l.capture); } catch (e) {} }
+    // Restore monkey-patched intrinsics (fetch/XHR/WebSocket/clipboard/execCommand).
+    const restorers = teardownRestorers.splice(0);
+    for (const r of restorers) { try { r(); } catch (e) {} }
+    // Release the singleton guard so a replacement runtime can boot in this tab — the guard must
+    // die with the runtime it guards, or a hand-off teardown bricks the tab for successors.
+    try {
+      const root = document.documentElement;
+      root.removeAttribute(SOFT_FILTER_SINGLETON_ATTR);
+      root.removeAttribute(SOFT_FILTER_SINGLETON_STARTED_ATTR);
+    } catch (e) {}
+    return {
+      timersCleared: timers.length,
+      observersDisconnected: observers.length,
+      listenersRemoved: listeners.length,
+      intrinsicsRestored: restorers.length
+    };
   }
   let applyHidingScheduled = false;
   // Coalesces bursts of applyHiding() into a single pass per microtask, for high-frequency incremental callers
@@ -6441,12 +6701,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function globalChatMessageHidden(el) {
     if (shouldLog("verbose")) log("→ globalChatMessageHidden", traceArgs(arguments));
     if (!el || !state.enabled) return false;
-    // Master toggle: when the global-chat feature is switched off, hide nothing here regardless of the map
-    // filters. '=== false' (not falsy) so a legacy saved state missing the key keeps the default-on behavior.
-    if (state.hideGlobalChat === false) return false;
     const id = normalizeProfileId(el.id || (el.getAttribute && el.getAttribute("id")));
     if (!id) return false;
+    // A manual block (middle-click-hide) always applies, same as on the map, regardless of the
+    // Global Chat auto-filter toggle below -- otherwise turning that toggle off would silently
+    // un-hide people you explicitly blocked, which isn't what the toggle is for.
     if (blocked.has(id)) return true;
+    // Global-chat auto-filter toggle: when off, skip the map-filter-derived rules below (profile
+    // terms, chat-recency, attitude, etc.) but manual blocks above still apply. '=== false' (not
+    // falsy) so a legacy saved state missing the key keeps the default-on behavior.
+    if (state.hideGlobalChat === false) return false;
     if (shouldHideByProfileTerms(id)) return true;
     if (shouldHideByRecentChats(id)) return true;
     if (shouldHideByRecentChats2h(id)) return true;
@@ -6475,10 +6739,31 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Toggle the hide class by author for exactly the given message elements. Shared by the full sweep
   // (applyGlobalChatHiding) and the mutation-observer's targeted per-added-node sweep below.
+  //
+  // Target el.parentElement (the per-message <app-global-chat-user-container> wrapper), NOT
+  // closest('[data-testid="global-chat-message-container"]') -- that testid sits on the single
+  // shared list viewport wrapping every message (one element for the whole *ngFor list), not on
+  // each message individually. Toggling the hide class there hid/showed the ENTIRE global chat
+  // panel based on whichever message the sweep processed last, instead of hiding just that
+  // message's author -- every other author's messages blinked on/off along with it.
   function applyGlobalChatHidingToMessages(msgs) {
+    // Per-call author-verdict memo: a busy room holds many messages from few authors, and the
+    // predicate chain re-derives the same verdict per message. Only id-keyed verdicts memoize;
+    // messages whose attitude must be parsed off THIS element's userStats line (no cached
+    // attitude) still evaluate individually.
+    const decided = /* @__PURE__ */ new Map();
     for (const el of msgs) {
-      const target = (el.closest && el.closest('[data-testid="global-chat-message-container"]')) || el;
-      target.classList.toggle("sniffies-gc-hide", globalChatMessageHidden(el));
+      const target = el.parentElement || el;
+      const id = normalizeProfileId(el.id || (el.getAttribute && el.getAttribute("id")));
+      const canMemo = !!id && (manualAttitudes[id] || attitudeCache.has(id));
+      let hidden;
+      if (canMemo && decided.has(id)) {
+        hidden = decided.get(id);
+      } else {
+        hidden = globalChatMessageHidden(el);
+        if (canMemo) decided.set(id, hidden);
+      }
+      target.classList.toggle("sniffies-gc-hide", hidden);
     }
   }
   // Sweep every global-chat message and toggle the hide class by author. Idempotent: re-shows a
@@ -6531,9 +6816,13 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (shouldLog("verbose")) log("→ updatePartials", traceArgs(arguments));
     if (updatePartialsBusy) {
       updatePartialsQueued = true;
-      return;
+      // An awaiting caller (e.g. hideNow) must actually wait for the in-flight run instead of
+      // resolving immediately with pre-fetch state — hand back the live run's promise.
+      return updatePartialsInFlight || Promise.resolve();
     }
     updatePartialsBusy = true;
+    let resolveUpdatePartialsInFlight = null;
+    updatePartialsInFlight = new Promise((resolve) => { resolveUpdatePartialsInFlight = resolve; });
     try {
       const { markerCount } = scanMarkers();
       const pending = getPendingIdsFromCurrentMarkers();
@@ -6551,13 +6840,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         const rows = await fetchPartials(batch);
         if (rows.length) {
           for (const p of rows) {
-            const id = p == null ? void 0 : p._id;
+            // Normalize the server _id to the same keyspace scanMarkers/blocked/attitudeCache use —
+            // a raw uppercase-hex or wrapped _id would never satisfy needsRefresh, re-fetching that
+            // marker forever and burning the 6/min budget.
+            const id = normalizeProfileId(p == null ? void 0 : p._id);
             if (!id) continue;
             ingestPresenceTimes(p, id);
             const att = extractAttitudeFromPartial(p);
             attitudeCache.set(id, { attitude: att, ts: now() });
             evaluateProfileFiltersFromRow(id, p);
-            exposeGlobal("__sniffiesLastPartialsSample", p);
+            exposeGlobal("__sniffiesLastPartialsSample", p, { sandboxOnly: true });
           }
         } else {
           for (const id of batch) {
@@ -6570,10 +6862,14 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       if (fullTextUpdated) applyHiding();
     } finally {
       updatePartialsBusy = false;
+      updatePartialsInFlight = null;
+      if (resolveUpdatePartialsInFlight) resolveUpdatePartialsInFlight();
       if (updatePartialsQueued) {
         updatePartialsQueued = false;
-        // Reentrancy coalescing: a call that arrived mid-run is replayed exactly once after the current run finishes.
-        queueMicrotask(() => updatePartials("queued"));
+        // Reentrancy coalescing: a call that arrived mid-run is replayed exactly once after the
+        // current run finishes. .catch keeps a transient failure from surfacing as an unhandled
+        // rejection (nothing awaits this replay).
+        queueMicrotask(() => updatePartials("queued").catch((e) => logWarn("updatePartials(queued) failed", e)));
       }
     }
   }
@@ -6687,7 +6983,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       blocked.add(id);
       blockedAt.set(id, now());
       recordHideAction(id);
-      exposeGlobal("__sniffiesLastShiftBlock", { id, ts: (/* @__PURE__ */ new Date()).toISOString() });
+      exposeGlobal("__sniffiesLastShiftBlock", { id, ts: (/* @__PURE__ */ new Date()).toISOString() }, { sandboxOnly: true });
       setStatus(`Shift-blocked: ${id}`);
     }
     if (markerEl) {
@@ -6712,11 +7008,14 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       id = getIdFromMapAtPoint(e.clientX, e.clientY);
     }
     if (!id) {
+      // Only fall back to a profile-link href when the link is inside a map marker — NOT one of the
+      // script's own panel links (bookmarks/matches). Shift-clicking a panel link is the ordinary
+      // open-in-new-window gesture (these are target="_blank"); block-toggling it and suppressing
+      // the navigation via stopImmediatePropagation would be a surprising side effect.
       const profileLink = e.target.closest("a[href*='/profile/']");
-      if (profileLink) {
-        const href = profileLink.getAttribute("href") || "";
-        const m = href.match(/\/profile\/([0-9a-f]{6,})/i);
-        if (m) id = m[1];
+      if (profileLink && !profileLink.closest(NAV_PANEL_SKIP_SELECTOR)
+        && (profileLink.closest(".maplibregl-marker") || profileLink.closest(".marker-container") || profileLink.closest(".marker-avatar"))) {
+        id = normalizeProfileId(profileIdFromHref(profileLink.getAttribute("href")));
       }
     }
     if (!id) return;
@@ -6735,7 +7034,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (shouldLog("verbose")) log("→ isMiddleClickChatWindowTarget", traceArgs(arguments));
     if (!isChatRoute()) return false;
     if (!target || !(target instanceof Element)) return false;
-    if (target.closest(".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-panel, .sniffies-chat-phrases-launcher, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal")) {
+    if (target.closest(NAV_PANEL_SKIP_SELECTOR)) {
       return false;
     }
     const chatWindowRoots = [];
@@ -6927,10 +7226,13 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function findChatInputElement() {
     if (shouldLog("verbose")) log("→ findChatInputElement", traceArgs(arguments));
     var _a, _b;
-    const candidates = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true']")).filter(isElementVisible).filter((el) => !el.closest(".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-launcher, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal"));
+    const candidates = Array.from(document.querySelectorAll("textarea, input[type='text'], [contenteditable='true']")).filter(isElementVisible).filter((el) => !el.closest(NAV_PANEL_SKIP_SELECTOR));
     if (!candidates.length) return null;
     let best = null;
-    let bestScore = -1;
+    // Positive evidence required: a candidate scoring 0 is any visible text input on the page (site
+    // search box, filter field). Returning one of those made isChatRoute() true on plain profile
+    // views and let the auto-send poller type into an unrelated field. Score must beat 0.
+    let bestScore = 0;
     for (const el of candidates) {
       const ph = String(((_a = el.getAttribute) == null ? void 0 : _a.call(el, "placeholder")) || "").toLowerCase();
       const aria = String(((_b = el.getAttribute) == null ? void 0 : _b.call(el, "aria-label")) || "").toLowerCase();
@@ -6980,8 +7282,11 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function clickChatSendButton(inputEl) {
     if (shouldLog("verbose")) log("→ clickChatSendButton", traceArgs(arguments));
     var _a, _b;
-    const scope = (inputEl == null ? void 0 : inputEl.closest("form, [class*='chat'], [class*='message']")) || document;
-    const buttons = Array.from(scope.querySelectorAll("button, [role='button']")).filter(isElementVisible).filter((btn) => !btn.closest(".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-launcher, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal"));
+    // No document-wide fallback: a send click must never escape the composer's own chat/form
+    // subtree (the old `|| document` could click any button anywhere whose label contains "send").
+    const scope = inputEl == null ? void 0 : inputEl.closest("form, [class*='chat'], [class*='message']");
+    if (!scope) return false;
+    const buttons = Array.from(scope.querySelectorAll("button, [role='button']")).filter(isElementVisible).filter((btn) => !btn.closest(NAV_PANEL_SKIP_SELECTOR));
     for (const btn of buttons) {
       const text = String(btn.textContent || "").trim().toLowerCase();
       const aria = String(((_a = btn.getAttribute) == null ? void 0 : _a.call(btn, "aria-label")) || "").toLowerCase();
@@ -7086,7 +7391,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       nonce: Math.random().toString(36).slice(2, 10)
     };
     try {
-      localStorage.setItem(AUTO_MESSAGE_SIGNAL_KEY, JSON.stringify(event));
+      lsSetSafe(AUTO_MESSAGE_SIGNAL_KEY, JSON.stringify(event));
     } catch (e) {
     }
   }
@@ -7225,15 +7530,30 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     const phrase = String(payload.phrase || "").trim();
     const ts = parseTimestamp(payload.ts) || now();
     const token = String(payload.token || "").trim();
+    // Authenticate the cross-tab signal: the key is page-writable localStorage, so any script on
+    // the origin could forge it to corrupt chat-activity state or close tabs. Only act when the
+    // payload's token matches a handle THIS tab actually issued (openAutoMessageChat stores it),
+    // and the claimed send time is within a short freshness window.
+    if (!token || !autoMessageTabHandles.has(token)) {
+      logWarn("auto-message signal rejected: unknown or missing token", { id, hasToken: !!token });
+      return false;
+    }
+    if (Math.abs(now() - ts) > 2 * 60 * 1e3) {
+      logWarn("auto-message signal rejected: stale/future timestamp", { id });
+      return false;
+    }
     syncOutgoingMessageState(id, phrase, ts, { markPhrase: true, refreshCurrentChat: true });
     closeAutoMessageTabHandle(token, id);
     return true;
   }
   // Storage-event listener: on a new AUTO_MESSAGE_SIGNAL_KEY value, parse it and dispatch to handleAutoMessageSignalPayload.
-  // Ignores other keys and unparseable JSON.
+  // Ignores other keys, other storage areas (sessionStorage fires the same event type), and unparseable JSON.
   function handleAutoMessageStorageEvent(e) {
     if (shouldLog("verbose")) log("→ handleAutoMessageStorageEvent", traceArgs(arguments));
     if (!e || e.key !== AUTO_MESSAGE_SIGNAL_KEY || !e.newValue) return;
+    try {
+      if (e.storageArea && e.storageArea !== localStorage) return;
+    } catch (e2) {}
     try {
       const payload = JSON.parse(e.newValue);
       handleAutoMessageSignalPayload(payload);
@@ -7271,16 +7591,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     url.searchParams.set(AUTO_MESSAGE_AUTOCLOSE_PARAM, "1");
     let opened = false;
     let tabHandle = null;
+    // GM_openInTab (Tampermonkey), else GM.openInTab (Greasemonkey 4 promise API); mirrors the
+    // gmGetValueSafe fallback so a GM4/extension host isn't left with no background-tab path.
+    const gmOpenInTab = typeof GM_openInTab === "function" ? GM_openInTab
+      : (typeof GM !== "undefined" && GM && typeof GM.openInTab === "function") ? GM.openInTab.bind(GM) : null;
     try {
-      if (typeof GM_openInTab === "function") {
+      if (gmOpenInTab) {
         try {
-          tabHandle = GM_openInTab(url.toString(), {
-            active: false,
-            insert: true,
-            setParent: true
-          });
+          tabHandle = gmOpenInTab(url.toString(), { active: false, insert: true, setParent: true });
         } catch (e) {
-          tabHandle = GM_openInTab(url.toString(), false);
+          tabHandle = gmOpenInTab(url.toString(), false);
         }
         opened = true;
       }
@@ -7288,7 +7608,11 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     if (!opened) {
       try {
-        const w = window.open(url.toString(), "_blank", "noopener,noreferrer");
+        // NOTE: no "noopener" — window.open() returns null by spec when noopener is set, even on
+        // success, which used to leave `opened` false and then ALSO navigate the current tab below
+        // (double auto-send + hijacked map view). The opener handle is also needed to register the
+        // tab so the cross-tab "sent" signal is accepted.
+        const w = window.open(url.toString(), "_blank");
         tabHandle = w;
         opened = !!w;
       } catch (e) {
@@ -7314,7 +7638,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       document.querySelectorAll("button, [role='button'], a")
     ).filter(isElementVisible);
     for (const el of closeCandidates) {
-      if (el.closest(".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-panel, .sniffies-chat-phrases-launcher, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal")) {
+      if (el.closest(NAV_PANEL_SKIP_SELECTOR)) {
         continue;
       }
       const text = String(el.textContent || "").toLowerCase();
@@ -7351,14 +7675,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     if (!id) {
       const profileLink = (_b = (_a = e.target) == null ? void 0 : _a.closest) == null ? void 0 : _b.call(_a, "a[href*='/profile/']");
-      if (profileLink) {
-        const href = profileLink.getAttribute("href") || "";
-        const m = href.match(/\/profile\/([0-9a-f]{6,})/i);
-        if (m) id = m[1];
+      // Exclude the script's own panel links — this event sends a real message, so a panel-row link
+      // under the cursor must not become the recipient.
+      if (profileLink && !profileLink.closest(NAV_PANEL_SKIP_SELECTOR)) {
+        id = profileIdFromHref(profileLink.getAttribute("href"));
       }
     }
+    // Only fall back to the active chat's own context. NOT getCurrentProfileId(), whose no-URL
+    // branch returns the document's FIRST profile link (site nav / a panel row) — a Shift+right-click
+    // on empty map would otherwise queue a real intro to an arbitrary unrelated profile.
     if (!id && routeChatProfileId) id = routeChatProfileId;
-    if (!id) id = getCurrentProfileId();
     return normalizeProfileId(id);
   }
   // Send a random 'intro' phrase to a profile via shift-right-click.
@@ -7382,7 +7708,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         return false;
       }
       syncOutgoingMessageState(normalizedId, phrase, now(), { markPhrase: false, refreshCurrentChat: true });
-      exposeGlobal("__sniffiesLastAutoMessage", { id: normalizedId, text: phrase, ts: (/* @__PURE__ */ new Date()).toISOString(), source: "chat-shift-right" });
+      exposeGlobal("__sniffiesLastAutoMessage", { id: normalizedId, text: phrase, ts: (/* @__PURE__ */ new Date()).toISOString(), source: "chat-shift-right" }, { sandboxOnly: true });
       setStatus(`Intro sent: ${normalizedId.slice(0, 8)}`);
       setTimeout(() => {
         closeCurrentProfileChatWindow(normalizedId);
@@ -7522,8 +7848,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       const sentTs = now();
       syncOutgoingMessageState(profileId, phrase, sentTs, { markPhrase: true, refreshCurrentChat: true });
       consumePendingAutoMessage(profileId);
-      exposeGlobal("__sniffiesLastAutoMessage", { id: profileId, text: phrase, ts: new Date(sentTs).toISOString() });
-      exposeGlobal("__sniffiesLastHowdy", { id: profileId, text: phrase, ts: new Date(sentTs).toISOString() });
+      exposeGlobal("__sniffiesLastAutoMessage", { id: profileId, text: phrase, ts: new Date(sentTs).toISOString() }, { sandboxOnly: true });
+      exposeGlobal("__sniffiesLastHowdy", { id: profileId, text: phrase, ts: new Date(sentTs).toISOString() }, { sandboxOnly: true });
       emitAutoMessageSignal({
         type: "sent",
         profileId,
@@ -7539,7 +7865,6 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     // Polls for the composer every 500ms, up to 24 attempts (~12s) before giving up.
     }, AUTO_MESSAGE_AUTOSEND_INTERVAL_MS);
   }
-  const NAV_PANEL_SKIP_SELECTOR = ".sniffies-soft-panel, .sniffies-soft-panel-launcher, .sniffies-chat-phrases-panel, .sniffies-chat-phrases-launcher, .sniffies-match-panel, .sniffies-bookmarks-panel, .sniffies-appointments-panel, .sniffies-notes-modal";
   // True if the event target is a text-entry control (text-like input, textarea, select, or contenteditable).
   // Excludes non-text input types (checkbox/radio/button/etc.); used to suppress hotkeys while typing.
   function isTypingTarget(target) {
@@ -7719,27 +8044,29 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       e.stopPropagation();
     }
   }
-  document.addEventListener("mousedown", handleShiftBlock, true);
+  // Registered through addTrackedListener so teardownSniffies() can remove every one with the
+  // same capture flag it was added with (previously none were removed on teardown).
+  addTrackedListener(document, "mousedown", handleShiftBlock, true);
   // Capture-phase listener (true) so the script intercepts the shift-right-click before the page.
-  document.addEventListener("mousedown", handleShiftRightAutoMessageDown, true);
-  document.addEventListener("mousedown", handleMiddleMark, true);
-  document.addEventListener("contextmenu", handleDoubleRightMessage, true);
-  document.addEventListener("contextmenu", handleChatPhraseContextMenu, true);
-  document.addEventListener("copy", handleChatCopyCapture, true);
-  document.addEventListener("click", handleSniffiesCopyDialogClick, true);
-  document.addEventListener("keydown", handleNavigationHotkeys, true);
-  window.addEventListener("storage", handleAutoMessageStorageEvent, true);
+  addTrackedListener(document, "mousedown", handleShiftRightAutoMessageDown, true);
+  addTrackedListener(document, "mousedown", handleMiddleMark, true);
+  addTrackedListener(document, "contextmenu", handleDoubleRightMessage, true);
+  addTrackedListener(document, "contextmenu", handleChatPhraseContextMenu, true);
+  addTrackedListener(document, "copy", handleChatCopyCapture, true);
+  addTrackedListener(document, "click", handleSniffiesCopyDialogClick, true);
+  addTrackedListener(document, "keydown", handleNavigationHotkeys, true);
+  addTrackedListener(window, "storage", handleAutoMessageStorageEvent, true);
   bindChatPhraseContextMenuCloser();
   // Copy the normalized blocked-ID list to the clipboard as pretty JSON; falls back to a prompt() if the Clipboard API is unavailable.
   function exportBlocked() {
     if (shouldLog("verbose")) log("→ exportBlocked", traceArgs(arguments));
     var _a;
     const text = JSON.stringify(normalizeIdList([...blocked]), null, 2);
-    if ((_a = navigator.clipboard) == null ? void 0 : _a.writeText) {
-      navigator.clipboard.writeText(text).then(() => alert("Blocked list copied to clipboard."));
-    } else {
-      prompt("Copy blocked list:", text);
-    }
+    // copyTextWithFallback handles rejection (a bare .then left an unhandled rejection and gave the
+    // user no fallback when the Clipboard API write failed).
+    copyTextWithFallback(text, "Copy blocked list:").then((ok) => {
+      if (ok) alert("Blocked list copied to clipboard.");
+    }).catch((e) => logWarn("exportBlocked copy failed", e));
   }
   // Prompt for a blocked list (JSON array or comma/space/newline-separated IDs), normalize, MERGE into the blocked set, then save and re-apply hiding.
   // On JSON parse failure, falls back to splitting on whitespace/commas.
@@ -7863,17 +8190,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         for (const row of imported) {
           const id = normalizeProfileId((row == null ? void 0 : row.profileId) || (row == null ? void 0 : row.id));
           if (!id) continue;
-          bookmarks.set(id, {
-            profileId: id,
-            profileUrl: String((row == null ? void 0 : row.profileUrl) || profileUrlForId(id)),
-            profileLabel: String((row == null ? void 0 : row.profileLabel) || id.slice(0, 10)),
-            alias: String((row == null ? void 0 : row.alias) || "").trim().slice(0, 80),
-            categories: normalizeTagValues(row == null ? void 0 : row.categories),
-            tags: normalizeTagValues(row == null ? void 0 : row.tags),
-            lastSeenAt: parseTimestamp(row == null ? void 0 : row.lastSeenAt) || 0,
-            createdAt: parseTimestamp(row == null ? void 0 : row.createdAt) || now(),
-            updatedAt: parseTimestamp(row == null ? void 0 : row.updatedAt) || now()
-          });
+          bookmarks.set(id, normalizeBookmarkRow(id, row));
         }
         saveBookmarks();
       }
@@ -7899,7 +8216,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
         saveSeenChatDeletionEvents();
       }
       if (Array.isArray(data.hideHistory)) {
-        hideHistory = data.hideHistory.map((row) => ({ id: normalizeProfileId(row == null ? void 0 : row.id), ts: parseTimestamp(row == null ? void 0 : row.ts) || now() })).filter((row) => !!row.id).slice(-500);
+        // MERGE with local history (was a replace, contradicting this function's own "merges (does
+        // not replace)" contract and every other section): keep both sides, oldest-first, cap 500.
+        {
+          const importedHideHistory = data.hideHistory.map((row) => ({ id: normalizeProfileId(row == null ? void 0 : row.id), ts: parseTimestamp(row == null ? void 0 : row.ts) || now() })).filter((row) => !!row.id);
+          hideHistory = [...hideHistory, ...importedHideHistory].sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-500);
+        }
         saveHideHistory();
       }
       if (data.phraseHistory && typeof data.phraseHistory === "object") {
@@ -7994,8 +8316,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       source: (options == null ? void 0 : options.source) || "oauth-pkce"
     }, value);
     gdriveTokenCacheInitialized = true;
-    await gmSetValueSafe(GDRIVE_TOKEN_KEY, gdriveTokenCache);
-    await gmSetValueSafe(GDRIVE_TOKEN_META_KEY, gdriveTokenMetaCache);
+    const tokenSaved = await gmSetValueSafe(GDRIVE_TOKEN_KEY, gdriveTokenCache);
+    const metaSaved = await gmSetValueSafe(GDRIVE_TOKEN_META_KEY, gdriveTokenMetaCache);
+    if (!tokenSaved || !metaSaved) {
+      // GM storage unavailable (e.g. host exposes neither GM_* nor GM.*): the token would be
+      // silently lost on every reload. Keep the in-memory cache, warn loudly, and do NOT purge the
+      // legacy localStorage copy — it may be the only surviving persistence.
+      logWarn("GM storage unavailable — Google Drive token not persisted (will not survive reload)");
+      setStatus("Drive token not persisted (GM storage unavailable)");
+      return;
+    }
     localStorage.removeItem(GDRIVE_TOKEN_KEY);
     localStorage.removeItem(GDRIVE_TOKEN_META_KEY);
   }
@@ -8049,12 +8379,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Persist the Drive file id to localStorage.
   function saveGDriveFileId(fileId) {
     if (shouldLog("verbose")) log("→ saveGDriveFileId", traceArgs(arguments));
-    localStorage.setItem(GDRIVE_FILE_ID_KEY, fileId);
+    lsSetSafe(GDRIVE_FILE_ID_KEY, fileId);
   }
   // Record the current time as the last Drive sync timestamp in localStorage.
   function setGDriveSyncTime() {
     if (shouldLog("verbose")) log("→ setGDriveSyncTime", traceArgs(arguments));
-    localStorage.setItem(GDRIVE_SYNC_TIME_KEY, now().toString());
+    lsSetSafe(GDRIVE_SYNC_TIME_KEY, now().toString());
   }
   // Set the module-level sync status and update the .sniffies-sync-status badge text/class.
   // For 'synced' it shows the last-sync time and, if known, a 'token expires in Nm' hint.
@@ -8277,6 +8607,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           }
           // CSRF check: returned OAuth state must exactly match the session's state nonce or the exchange is refused.
           if (!parsed.state || parsed.state !== pendingOAuthPkce.state) {
+            // Security event — logged unconditionally so it's recoverable from the console after the alert.
+            logError("OAuth state mismatch — possible CSRF; token exchange refused");
             alert("OAuth state mismatch. Start again with Open Google Auth.");
             return;
           }
@@ -8356,7 +8688,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       gdriveSyncBusy = false;
       if (gdriveSyncQueued) {
         gdriveSyncQueued = false;
-        queueMicrotask(() => syncNotesToGDrive());
+        queueMicrotask(() => Promise.resolve(syncNotesToGDrive()).catch((e) => logWarn("syncNotesToGDrive failed", e)));
       }
     }
   }
@@ -8428,15 +8760,25 @@ ${JSON.stringify(fileContent)}\r
         });
         if (response.ok) {
           const data = await response.json();
-          saveGDriveFileId(data.id);
-          logInfo("Created Google Drive file:", data.id);
+          const newFileId = String((data && data.id) || "").trim();
+          if (newFileId) {
+            saveGDriveFileId(newFileId);
+            logInfo("Created Google Drive file:", newFileId);
+          } else {
+            // Guard: persisting a missing id would store the literal string "undefined" and every
+            // later sync would PATCH /files/undefined forever with only a generic failure.
+            logWarn("Drive create returned no file id — sync not persisted");
+            updateSyncStatus("error");
+            return;
+          }
         }
       }
-      if (response.ok || response.status === 200) {
+      if (response.ok) {
         setGDriveSyncTime();
         updateSyncStatus("synced");
         logInfo("Successfully synced data to Google Drive");
       } else if (response.status === 401) {
+        logWarn("Drive request 401 — clearing stored token (reason: expired/invalid)");
         await clearGDriveToken();
         updateSyncStatus("disconnected");
         alert("Google token expired/invalid. Reconnect Google Drive.");
@@ -8480,8 +8822,16 @@ ${JSON.stringify(fileContent)}\r
       });
       if (response.ok) {
         const data = await response.json();
-        if (data.notes) {
-          notes = data.notes;
+        if (data.notes && typeof data.notes === "object" && !Array.isArray(data.notes)) {
+          // Normalize like importData does: a tampered/stale Drive file must not be able to replace
+          // the notes store with a non-object or inject unnormalized ids / non-string values.
+          const nextNotes = {};
+          for (const [rawId, val] of Object.entries(data.notes)) {
+            const normalizedId = normalizeProfileId(rawId);
+            if (!normalizedId) continue;
+            nextNotes[normalizedId] = String(val != null ? val : "").slice(0, 5e3);
+          }
+          notes = nextNotes;
           saveNotes();
           logInfo("Loaded notes from Google Drive");
         }
@@ -8515,17 +8865,7 @@ ${JSON.stringify(fileContent)}\r
           for (const row of imported) {
             const id = normalizeProfileId((row == null ? void 0 : row.profileId) || (row == null ? void 0 : row.id));
             if (!id) continue;
-            bookmarks.set(id, {
-              profileId: id,
-              profileUrl: String((row == null ? void 0 : row.profileUrl) || profileUrlForId(id)),
-              profileLabel: String((row == null ? void 0 : row.profileLabel) || id.slice(0, 10)),
-              alias: String((row == null ? void 0 : row.alias) || "").trim().slice(0, 80),
-              categories: normalizeTagValues(row == null ? void 0 : row.categories),
-              tags: normalizeTagValues(row == null ? void 0 : row.tags),
-              lastSeenAt: parseTimestamp(row == null ? void 0 : row.lastSeenAt) || 0,
-              createdAt: parseTimestamp(row == null ? void 0 : row.createdAt) || now(),
-              updatedAt: parseTimestamp(row == null ? void 0 : row.updatedAt) || now()
-            });
+            bookmarks.set(id, normalizeBookmarkRow(id, row));
           }
           saveBookmarks();
           renderBookmarkPanel();
@@ -8536,6 +8876,7 @@ ${JSON.stringify(fileContent)}\r
         alert("Data loaded from Google Drive!");
         location.reload();
       } else if (response.status === 401) {
+        logWarn("Drive request 401 — clearing stored token (reason: expired/invalid)");
         await clearGDriveToken();
         updateSyncStatus("disconnected");
         alert("Google token expired/invalid. Reconnect Google Drive.");
@@ -8618,7 +8959,9 @@ ${JSON.stringify(fileContent)}\r
       const isVisible = rect.width > 100 && rect.height > 200 && computed.visibility !== "hidden" && computed.display !== "none";
       if (isVisible) {
         // Heuristic to recognize a profile card by its body text (height/weight like '180, 75' or the word 'looking').
-        const hasProfileInfo = el.textContent.includes("m,") || el.textContent.match(/\d+,\s*\d+["\']/) || el.innerText.includes("looking");
+        // textContent, not innerText: the substring probes don't need rendered text, and innerText
+        // forces a synchronous style+layout flush on every candidate.
+        const hasProfileInfo = el.textContent.includes("m,") || el.textContent.match(/\d+,\s*\d+["\']/) || el.textContent.includes("looking");
         if (hasProfileInfo) {
           log("Found visible dialog with profile info");
           return el;
@@ -8779,18 +9122,9 @@ ${JSON.stringify(fileContent)}\r
   // Body is identical to getLastChatInteractionTs.
   function getBookmarkLastInteractionTs(profileId) {
     if (shouldLog("verbose")) log("→ getBookmarkLastInteractionTs", traceArgs(arguments));
-    const id = normalizeProfileId(profileId);
-    if (!id) return 0;
-    const row = chatActivity.get(id);
-    // updatedAt is bookkeeping (the row's last write time), NOT a message time — exclude it so interaction
-    // recency reflects real messages and stays aligned with the chat-age badge.
-    const chatTs = row ? Math.max(
-      parseTimestamp(row.myLastTs) || 0,
-      parseTimestamp(row.theirLastTs) || 0,
-      parseTimestamp(row.anyLastTs) || 0
-    ) : 0;
-    const sentTs = parseTimestamp(howdySentAt[id]) || 0;
-    return Math.max(chatTs, sentTs);
+    // Alias kept for call-site readability; the byte-identical body previously duplicated
+    // getLastChatInteractionTs and the two had already been flagged as drift-prone.
+    return getLastChatInteractionTs(profileId);
   }
   // Latest chat-activity time for a profile: max of my/their/any/updatedAt row timestamps and howdy-sent time.
   // Ignores chat-preview rows (see getLastAnyChatInteractionTs).
@@ -8832,10 +9166,19 @@ ${JSON.stringify(fileContent)}\r
   // Max of chat-activity time and chat-preview time for a profile (union of both sources).
   function getLastAnyChatInteractionTs(profileId) {
     if (shouldLog("verbose")) log("→ getLastAnyChatInteractionTs", traceArgs(arguments));
-    return Math.max(
+    // Per-sweep memo: 4 hide predicates plus 3 launcher-count passes each recompute this per id per
+    // 2s sweep. Cleared at the top of applyHiding(), so within one sweep every repeat lookup is a
+    // Map hit; worst-case staleness between sweeps is one apply interval.
+    if (chatInteractionTsMemoActive) {
+      const memoized = chatInteractionTsMemo.get(profileId);
+      if (memoized !== void 0) return memoized;
+    }
+    const ts = Math.max(
       getLastChatInteractionTs(profileId),
       getLastPreviewInteractionTs(profileId)
     );
+    if (chatInteractionTsMemoActive) chatInteractionTsMemo.set(profileId, ts);
+    return ts;
   }
   // True if the profile has any recorded chat or preview interaction at all.
   function hasAnyChatInteraction(profileId) {
@@ -8912,7 +9255,7 @@ ${JSON.stringify(fileContent)}\r
     else if (shouldHideByAnyChats(id)) hiddenReasons.push("Has chat history");
     else if (shouldHideByMissingChatHistory(id)) hiddenReasons.push("Missing chat history");
     else if (shouldHideByNotOnlineWindow(id)) hiddenReasons.push(`Not online in last ${formatNotOnlineWindowLong()}`);
-    else if (shouldHideByRepeatedDelete(id)) hiddenReasons.push("Deleted their messages 2+ times");
+    else if (shouldHideByRepeatedDelete(id)) hiddenReasons.push(`Deleted their messages ${REPEATED_DELETE_HIDE_THRESHOLD}+ times`);
     else if (shouldHideByUnansweredOut(id)) hiddenReasons.push(`Sent ${UNANSWERED_OUT_HIDE_THRESHOLD}+ messages with no reply`);
     else if (shouldHideAttitude(attitude)) hiddenReasons.push(`Hidden attitude: ${formatAttitudeLabel(attitude)}`);
     return {
@@ -8938,7 +9281,7 @@ ${JSON.stringify(fileContent)}\r
         label: summary.label || `Profile ${id.slice(0, 10)}`,
         imageUrl: summary.imageUrl || getMarkerImageUrl(id),
         distance,
-        distanceLabel: formatDistance(distance).replace(/^distance:\s*/i, ""),
+        distanceLabel: formatDistance(distance, { prefix: false }),
         profileText: cleanDisplayText(summary.profileText || "", 600),
         preferences: normalizePreferenceList(summary.preferences || []),
         notes: String(notes[id] || ""),
@@ -9180,10 +9523,10 @@ ${JSON.stringify(fileContent)}\r
     return true;
   }
   // Format a distance as "distance: N.N mi", or "distance: n/a" when not finite.
+  // Alias of formatDistance (the two were byte-equivalent: Number.isFinite(null) is already false).
   function formatBookmarkDistance(distance) {
     if (shouldLog("verbose")) log("→ formatBookmarkDistance", traceArgs(arguments));
-    if (!Number.isFinite(distance)) return "distance: n/a";
-    return `distance: ${distance.toFixed(1)} mi`;
+    return formatDistance(distance);
   }
   // Format a last-interaction timestamp as "last interaction: <age> ago", or "...: never" when missing.
   function formatBookmarkInteraction(ts) {
@@ -9691,26 +10034,25 @@ ${JSON.stringify(fileContent)}\r
       clearInterval(profileContainerCheckTimer);
       profileContainerCheckTimer = 0;
     }
-    profileContainerObserver = new MutationObserver(() => {
+    // One shared check used by both the observer (primary) and the interval (safety net for
+    // mutations the childList filter misses); previously two byte-identical inline bodies.
+    const checkWidgetsStillMounted = () => {
       if (!document.body.contains(container)) return;
       const notesStillThere = container.querySelector(".sniffies-profile-notes");
       const reminderStillThere = container.querySelector(".sniffies-profile-reminder");
       if (!notesStillThere || !reminderStillThere) {
         scheduleProfileDisplayRefresh(profileId, 120);
       }
-    });
+    };
+    profileContainerObserver = new MutationObserver(checkWidgetsStillMounted);
     profileContainerObserver.observe(container, {
       childList: true,
       subtree: false
     });
-    profileContainerCheckTimer = setInterval(() => {
-      if (!document.body.contains(container)) return;
-      const notesStillThere = container.querySelector(".sniffies-profile-notes");
-      const reminderStillThere = container.querySelector(".sniffies-profile-reminder");
-      if (!notesStillThere || !reminderStillThere) {
-        scheduleProfileDisplayRefresh(profileId, 120);
-      }
-    }, 1500);
+    // Safety-net poll, lengthened from 1.5s (the observer covers childList on the same node);
+    // registered in bootTimers so teardownSniffies() stops it.
+    profileContainerCheckTimer = setInterval(checkWidgetsStillMounted, 5e3);
+    bootTimers.push(profileContainerCheckTimer);
   }
   // Global observer: detect profile/container changes on the SPA and schedule a display refresh.
   // Body MutationObserver (href/data-testid only — see attributeFilter below) + 1500ms poll; also kicks an initial refresh.
@@ -9719,7 +10061,12 @@ ${JSON.stringify(fileContent)}\r
     let lastProfileId = null;
     let lastContainer = null;
     logInfo("Starting profile observer");
-    const observer = new MutationObserver(() => {
+    // Debounced: on an Angular+MapLibre page this body-wide observer fires constantly, and its body
+    // runs the reflow-heavy findProfileContainer() heuristic. Mutation bursts coalesce into one
+    // check ~150ms after the first mutation of the burst.
+    let profileCheckPending = 0;
+    const runProfileCheck = () => {
+      profileCheckPending = 0;
       const profileId = normalizeProfileId(getCurrentProfileId());
       if (!profileId) return;
       const container = findProfileContainer();
@@ -9729,6 +10076,10 @@ ${JSON.stringify(fileContent)}\r
         lastContainer = container;
         scheduleProfileDisplayRefresh(profileId, 220);
       }
+    };
+    const observer = new MutationObserver(() => {
+      if (profileCheckPending) return;
+      profileCheckPending = setTimeout(runProfileCheck, 150);
     });
     observer.observe(document.body, {
       childList: true,
@@ -9762,10 +10113,12 @@ ${JSON.stringify(fileContent)}\r
     }
   }
   // Format a numeric distance as 'distance: N.N mi', or 'distance: n/a' when missing/non-finite.
-  function formatDistance(distance) {
+  // Pass { prefix: false } for the bare "N.N mi" form (replaces the strip-the-prefix regex at the
+  // profile-table call site).
+  function formatDistance(distance, { prefix = true } = {}) {
     if (shouldLog("verbose")) log("→ formatDistance", traceArgs(arguments));
-    if (distance == null || !Number.isFinite(distance)) return "distance: n/a";
-    return `distance: ${distance.toFixed(1)} mi`;
+    const body = !Number.isFinite(distance) ? "n/a" : `${distance.toFixed(1)} mi`;
+    return prefix ? `distance: ${body}` : body;
   }
   // Return include-match rows sorted by ascending distance (n/a sorts last), tie-broken by id.
   function sortedIncludeMatches() {
@@ -9854,6 +10207,11 @@ ${JSON.stringify(fileContent)}\r
     panel2.style.display = "flex";
     const list = panel2.querySelector("#sfMatchList");
     if (!list) return;
+    // Skip the full list teardown/rebuild (createElement + addEventListener per row, every 2s
+    // sweep) when the rows are unchanged — counts/visibility above are already refreshed.
+    const signature = rows.map((r) => `${r.id}|${r.includeTerm}|${r.distance}`).join("\n");
+    if (list.__sniffiesRowsSignature === signature) return;
+    list.__sniffiesRowsSignature = signature;
     list.textContent = "";
     for (const row of rows) {
       const item = document.createElement("div");
@@ -10143,6 +10501,13 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     }
     const list = panel2.querySelector("#sfBookmarkList");
     if (!list) return;
+    // Don't tear down the list while the user is mid-edit in one of its inputs (alias/categories/
+    // tags): removing a focused input fires no blur, so its on-blur persist() never runs and the
+    // typed edit is silently discarded. The periodic 15s refresh / markBookmarkSeen save otherwise
+    // rebuilds on top of an active edit. Skipped rebuilds still catch up on the next idle refresh.
+    if (list.contains(document.activeElement) && document.activeElement !== list) return;
+    // Clear before re-appending — buildBookmarkPanel returns a CACHED panel, so without this every
+    // render (15s refresh, each save, each broadcast tick) appends a duplicate set of rows.
     list.textContent = "";
     const allRows = sortedBookmarks();
     const rows = allRows.filter(bookmarkMatchesFilters);
@@ -10176,7 +10541,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       const top = document.createElement("div");
       top.className = "item-top";
       const link = document.createElement("a");
-      link.href = row.profileUrl || profileUrlForId(id);
+      link.href = profileUrlForId(id); // regenerate from the normalized id; never trust a stored profileUrl (import/Drive can plant an arbitrary click-through URL)
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       link.textContent = bookmarkDisplayName(row);
@@ -10324,7 +10689,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       item.className = `item ${status}`;
       const left = document.createElement("div");
       const link = document.createElement("a");
-      link.href = row.profileUrl || profileUrlForId(row.profileId);
+      link.href = profileUrlForId(row.profileId); // regenerate from id; never trust a stored profileUrl
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       link.textContent = row.profileLabel || row.profileId;
@@ -10443,7 +10808,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       }
     }
     // Cap the dismissed-id set at 1500 by evicting the oldest entries (Set iteration order == insertion
-    // order). A dismissed id is REMOVED from includeMatches at dismiss time (see dismissAllIncludeMatches),
+    // order). A dismissed id is REMOVED from includeMatches at dismiss time (see clearAllIncludeMatches),
     // so rebuilding from includeMatches' current membership would keep only currently-active (i.e. NOT
     // dismissed) ids and wipe almost all real dismissal history — trim by recency instead.
     if (includeDismissed.size > 1500) {
@@ -10488,7 +10853,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     for (const [id, row] of Object.entries(phraseHistory)) {
       const updated = parseTimestamp(row == null ? void 0 : row.updatedAt);
       // Phrase history entries expire after 90 days.
-      const stale = !updated || t - updated > 90 * 24 * 60 * 60 * 1e3;
+      const stale = !updated || t - updated > PHRASE_HISTORY_RETENTION_MS;
       const invalidId = !normalizeProfileId(id);
       if (stale || invalidId) {
         delete phraseHistory[id];
@@ -10503,7 +10868,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       // Phrase usage stats expire by AGE only (180 days). Do NOT delete just because a phrase isn't currently
       // canned — editing or removing a phrase would otherwise wipe its usage history, and re-adding the same
       // phrase would reset its count/recency to zero.
-      const stale = !lastUsedAt || t - lastUsedAt > 180 * 24 * 60 * 60 * 1e3;
+      const stale = !lastUsedAt || t - lastUsedAt > PHRASE_STATS_RETENTION_MS;
       if (!normalizedKey || count <= 0 || stale) {
         delete phraseStats[key];
         prunedPhraseStats += 1;
@@ -10547,15 +10912,16 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     for (const [id, sentTs] of Object.entries(howdySentAt)) {
       const ts = parseTimestamp(sentTs);
       // Howdy/auto-intro 'sent at' records expire after 7 days.
-      if (!ts || t - ts > 7 * 24 * 60 * 60 * 1e3) {
+      if (!ts || t - ts > HOWDY_RETENTION_MS) {
         delete howdySentAt[id];
         prunedHowdy += 1;
       }
     }
     if (prunedHowdy) saveHowdySentMap();
-    // Keep only the 60 most-recent chat-capture samples.
-    if (chatCaptureStats.recent.length > 60) {
-      chatCaptureStats.recent = chatCaptureStats.recent.slice(-60);
+    // Keep only the 30 most-recent chat-capture samples (recordChatCapture caps at 30 on push; the
+    // old GC cap of 60 was unreachable and misleading).
+    if (chatCaptureStats.recent.length > 30) {
+      chatCaptureStats.recent = chatCaptureStats.recent.slice(-30);
     }
     const urlEntries = Object.entries(chatCaptureStats.urls);
     // Cap captured-URL stats at 240 entries, keeping the highest-hit URLs.
@@ -10743,9 +11109,15 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     let left = rowStartLeft;
     let rowTop = Math.max(0, Math.round(rect.top));
     let rowHeight = 0;
-    for (const btn of buttons) {
-      const width = btn.offsetWidth || 120;
-      const height = btn.offsetHeight || 26;
+    // Measure phase (reads only): interleaving offsetWidth reads with style writes forced one
+    // synchronous layout per button; measuring everything first, then writing, costs one layout.
+    const measured = buttons.map((btn) => ({
+      btn,
+      width: btn.offsetWidth || 120,
+      height: btn.offsetHeight || 26
+    }));
+    const placements = [];
+    for (const { btn, width, height } of measured) {
       // Wrap before placing a button that would overflow the right edge — but never on a row's first slot
       // (left === wrapStartLeft), so a button wider than the row still lands instead of looping forever.
       if (left > wrapStartLeft && left + width > maxRight) {
@@ -10754,11 +11126,15 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
         rowHeight = 0;
       }
       const clampedLeft = Math.max(0, Math.min(left, maxRight - width));
-      btn.style.left = `${clampedLeft}px`;
-      btn.style.top = `${rowTop}px`;
-      btn.style.right = "auto";
+      placements.push({ btn, left: clampedLeft, top: rowTop });
       left = clampedLeft + width + offset;
       if (height > rowHeight) rowHeight = height;
+    }
+    // Commit phase (writes only).
+    for (const p of placements) {
+      p.btn.style.left = `${p.left}px`;
+      p.btn.style.top = `${p.top}px`;
+      p.btn.style.right = "auto";
     }
   }
   // Toggle the hide-recent-chats-24h filter: persist, re-apply hiding, refresh launcher, report count.
@@ -10920,7 +11296,17 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     updateAttitudeFilterLaunchers();
     positionTopLaunchers();
     if (!launcherResizeBound) {
-      window.addEventListener("resize", positionTopLaunchers, { passive: true });
+      // rAF-coalesced: a window drag fires resize at ~60Hz and the handler measures ~15 buttons.
+      let launcherResizeRafPending = false;
+      const onLauncherResize = () => {
+        if (launcherResizeRafPending) return;
+        launcherResizeRafPending = true;
+        requestAnimationFrame(() => {
+          launcherResizeRafPending = false;
+          positionTopLaunchers();
+        });
+      };
+      addTrackedListener(window, "resize", onLauncherResize, false);
       launcherResizeBound = true;
     }
     return launcher;
@@ -11139,7 +11525,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       updateSoftPanelViewportBounds(panel2);
     });
     if (!softPanelViewportResizeBound) {
-      window.addEventListener("resize", () => updateSoftPanelViewportBounds(panel2), { passive: true });
+      addTrackedListener(window, "resize", () => updateSoftPanelViewportBounds(panel2), false);
       softPanelViewportResizeBound = true;
     }
     const enabled = panel2.querySelector("#sfEnabled");
@@ -11209,7 +11595,15 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     updateRateCounter();
     if (!rateCountdownTimer) {
       // Starts the once-per-second API-budget countdown; guarded so only one timer is ever created.
-      rateCountdownTimer = setInterval(updateRateCounter, 1e3);
+      // Skips ticks while the tab is hidden or the panel is closed — each tick reads + JSON-parses
+      // localStorage, pure waste against a display:none pill. Registered in bootTimers so
+      // teardownSniffies() actually stops it.
+      rateCountdownTimer = setInterval(() => {
+        if (isUiWorkSuspended()) return;
+        if (softPanelEl && softPanelEl.style.display === "none") return;
+        updateRateCounter();
+      }, 1e3);
+      bootTimers.push(rateCountdownTimer);
     }
     enabled.checked = state.enabled;
     // '!== false' default-on idiom: an undefined/missing flag is treated as enabled.
@@ -11561,7 +11955,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       }
       if (!confirm(`Clear all blocked profiles (${blocked.size})?`)) return;
       blocked.clear();
+      blockedAt.clear();
       saveBlockedSet();
+      saveBlockedAtMap();
       applyHiding();
       setStatus("Cleared blocked profiles");
     });
@@ -11759,6 +12155,8 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     highlightUnspecified: !!state.highlightUnspecified,
     excludeProfileTermsEnabled: state.excludeProfileTermsEnabled !== false,
     includeProfileTermsEnabled: state.includeProfileTermsEnabled !== false,
+    hideUnansweredOut: state.hideUnansweredOut !== false,
+    hideRepeatedDeleters: state.hideRepeatedDeleters !== false,
     excludeProfileTerms: String(state.excludeProfileTerms || ""),
     includeProfileTerms: String(state.includeProfileTerms || ""),
     introMessages: String(state.introMessages || ""),
@@ -11818,7 +12216,12 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       "showMatchPanel",
       "showBookmarkPanel",
       "showAppointmentPanel",
-      "showChatPhrasePanel"
+      "showChatPhrasePanel",
+      // Default-on auto-hide gates: without these entries the `=== false` off-switches in
+      // shouldHideByUnansweredOut/shouldHideByRepeatedDelete were unreachable except by
+      // hand-editing localStorage.
+      "hideUnansweredOut",
+      "hideRepeatedDeleters"
     ];
     let changed = false;
     let textFiltersChanged = false;
@@ -11980,7 +12383,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
         break;
       case "clearBlocked":
         blocked.clear();
+        blockedAt.clear();
         saveBlockedSet();
+        saveBlockedAtMap();
         applyHiding();
         setStatus("Cleared blocked profiles");
         break;
@@ -12304,10 +12709,10 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   // own doc comment) Tampermonkey's unsafeWindow so it is callable from the page console. Anything
   // that mutates state, triggers network calls, sends messages, or exposes bookmark/appointment
   // content is sandboxOnly — reachable only from the userscript's own sandbox realm, not the page's.
-  exposeGlobal("__sniffiesShowMatchPanel", sniffiesShowMatchPanel);
-  exposeGlobal("__sniffiesShowPanel", sniffiesShowPanel);
-  exposeGlobal("__sniffiesHidePanel", sniffiesHidePanel);
-  exposeGlobal("__sniffiesGetSettings", sniffiesGetSettings);
+  exposeGlobal("__sniffiesShowMatchPanel", sniffiesShowMatchPanel, { sandboxOnly: true });
+  exposeGlobal("__sniffiesShowPanel", sniffiesShowPanel, { sandboxOnly: true });
+  exposeGlobal("__sniffiesHidePanel", sniffiesHidePanel, { sandboxOnly: true });
+  exposeGlobal("__sniffiesGetSettings", sniffiesGetSettings, { sandboxOnly: true });
   exposeGlobal("__sniffiesUpdateSettings", updateSettingsFromPopup, { sandboxOnly: true });
   exposeGlobal("__sniffiesRunAction", runPopupAction, { sandboxOnly: true });
   exposeGlobal("__sniffiesProfileTextStats", sniffiesProfileTextStats);
@@ -12316,11 +12721,11 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesSoftFilterDebug", sniffiesSoftFilterStats);
   exposeGlobal("__sniffiesForcePartialsFetch", sniffiesForcePartialsFetch, { sandboxOnly: true });
   exposeGlobal("__sniffiesExtractAttitude", sniffiesExtractAttitude);
-  exposeGlobal("__sniffiesChatAgeStats", sniffiesChatAgeStats);
+  exposeGlobal("__sniffiesChatAgeStats", sniffiesChatAgeStats, { sandboxOnly: true });
   exposeGlobal("__sniffiesSetSelfId", sniffiesSetSelfId, { sandboxOnly: true });
   exposeGlobal("__sniffiesForceChatRefresh", sniffiesForceChatRefresh, { sandboxOnly: true });
   exposeGlobal("__sniffiesRescanChatAges", sniffiesRescanChatAges, { sandboxOnly: true });
-  exposeGlobal("__sniffiesChatCaptureDebug", sniffiesChatCaptureDebug);
+  exposeGlobal("__sniffiesChatCaptureDebug", sniffiesChatCaptureDebug, { sandboxOnly: true });
   exposeGlobal("__sniffiesChatBadgeDebug", sniffiesChatBadgeDebug);
   exposeGlobal("__sniffiesAppointments", sniffiesAppointments, { sandboxOnly: true });
   exposeGlobal("__sniffiesBookmarks", sniffiesBookmarks, { sandboxOnly: true });
@@ -12329,7 +12734,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesMemoryStats", sniffiesMemoryStats);
   exposeGlobal("__sniffiesRunMemoryGc", sniffiesRunMemoryGc, { sandboxOnly: true });
   exposeGlobal("__sniffiesTeardown", teardownSniffies, { sandboxOnly: true });
-  exposeGlobal("__sniffiesGetProfileTableData", sniffiesGetProfileTableData);
+  // sandboxOnly: returns private per-profile notes and (with hydrate:true) can fire credentialed
+  // network requests — must not be callable from the page realm.
+  exposeGlobal("__sniffiesGetProfileTableData", sniffiesGetProfileTableData, { sandboxOnly: true });
   exposeGlobal("__sniffiesProfileLastActive", () => {
     const t = now();
     const out = {};
@@ -12338,9 +12745,10 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       out[id] = { lastActiveTs: ts, minutesAgo: Math.round((t - ts) / 6e4), onMap: idToMarker.has(id) };
     }
     return out;
-  });
-  exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases);
+ 
+  }, { sandboxOnly: true });
+  exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.11.2)");
+  logInfo("Sniffies soft filter loaded (v0.11.4)");
 })();

@@ -1,0 +1,16 @@
+# The userscript itself is dependency-free (one .txt, nothing bundled), and
+# lib/ has no runtime dependencies either — this only watches the dev toolchain
+# (vitest, jsdom, eslint) in devDependencies.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "chore"
