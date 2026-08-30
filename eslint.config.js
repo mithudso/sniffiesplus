@@ -5,13 +5,15 @@
 import globals from "globals";
 
 export default [
-  // Ignore deps, coverage, .bak snapshots, and iCloud/Finder conflict copies ("name 2.txt") — the latter
-  // are stale duplicates of the canonical versioned .txt, not source to lint.
-  { ignores: ["node_modules/**", "coverage/**", "**/*.bak", "**/* [0-9].txt"] },
+  // Ignore deps, coverage, .bak snapshots, iCloud/Finder conflict copies ("name 2.txt") — stale
+  // duplicates of the canonical versioned .txt — and the frozen site snapshot's vendor bundles.
+  { ignores: ["node_modules/**", "coverage/**", "**/*.bak", "**/* [0-9].txt", "Sniffies App _ Map_files/**", "dist/**"] },
 
-  // The userscript: one browser IIFE, shipped as a .txt.
+  // The userscript: one browser IIFE, shipped as a .txt. Glob covers every root-level .txt so a
+  // renamed variant (e.g. sniffiesplus.txt) still gets no-undef/TDZ linting — the case-sensitive
+  // "Sniffies*.txt" silently skipped it.
   {
-    files: ["Sniffies*.txt"],
+    files: ["*.txt"],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "script",
@@ -43,9 +45,27 @@ export default [
     },
   },
 
-  // Dev tooling: tests (Node + jsdom browser globals + imported Vitest API) and the index generator.
+  // The interaction library: first-party ES modules that run in the browser (fetch, location,
+  // getComputedStyle, WebSocket, AbortController). No Node globals.
   {
-    files: ["test/**/*.mjs", "regen-index.mjs", "eslint.config.js", "vitest.config.js"],
+    files: ["lib/**/*.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: { ...globals.browser, unsafeWindow: "readonly" },
+    },
+    rules: {
+      "no-undef": "error",
+      "no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_", caughtErrors: "none" }],
+      "no-dupe-keys": "error",
+      "no-unreachable": "error",
+    },
+  },
+
+  // Dev tooling: tests (Node + jsdom browser globals + imported Vitest/node:test API), the build
+  // script, and the index generator.
+  {
+    files: ["test/**/*.mjs", "scripts/**/*.mjs", "regen-index.mjs", "eslint.config.js", "vitest.config.js"],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "module",
