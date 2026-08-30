@@ -22,11 +22,13 @@ that runs in the page.
 The entire codebase is one file:
 
 ```
-Sniffies Soft Filter (Bottom - Vers Bottom)-0.8.1.txt   # ~11,900 lines, ~470 declarations (live counts in INDEX.md)
+Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt   # ~12,500 lines, one IIFE
+sniffiesplus.txt                                            # the working/optimization variant
 ```
 
 The filename ends in `.txt` (not `.js`) but the content is JavaScript with a
-`// ==UserScript==` metadata header.
+`// ==UserScript==` metadata header. A small ES-module **interaction library** now lives under
+`lib/` (built from the same observed surface); see `lib/README.md`.
 
 ## Read this first
 
@@ -35,24 +37,19 @@ OVERVIEW** (purpose, user controls, mouse/keyboard shortcuts, data model, Drive-
 Read that block before doing anything — it is more current than any summary and is not
 duplicated here.
 
-For navigating the ~11,900-line file, see **`INDEX.md`** (now at
-`~/.claude/skill-consolidation/INDEX.md`) — a line-numbered map of every
-region, the core engine, caches, UI builders, interaction handlers, boot sequence, and the
-`window.__sniffies*` debug API. Line numbers drift as the file is edited, so **`INDEX.md` is
-generated** — regenerate it with `node ~/.claude/skill-consolidation/regen-index.mjs`
-(descriptions are curated in that script, not in `INDEX.md`; it reads the source `.txt` from
-this folder via its hardcoded `SRC_DIR`, overridable with the `SNIFFIES_SRC_DIR` env var).
-`node ~/.claude/skill-consolidation/regen-index.mjs --check` exits non-zero when the index is
-stale. When in doubt, grep the symbol name rather than trusting a number.
+For navigating the file, see **`docs/codebase-overview.md`** (human-readable map, with
+`docs/high_signal_file_index.json` as its machine-readable twin) and **`docs/COMPONENTS.md`** (the
+major pieces + key exports). Line numbers drift as the file is edited, so grep the symbol name
+rather than trusting a number. (A previous `INDEX.md` / `regen-index.mjs` generator under
+`~/.claude/skill-consolidation/` is gone — those paths are dead; use the `docs/` files above.)
 
-For the **target site's** DOM/selectors/globals, see **`SITE-INDEX.md`** (also moved to
-`~/.claude/skill-consolidation/`) — a reverse-engineering
-reference built from a saved snapshot (`Sniffies App _ Map.html` + `_files/`). It documents the
-real Sniffies map DOM (marker structure, profile-ID encoding, attitude icons, `data-testid`
-inventory), `window.SNIFFIES` config, `/api/*` endpoints, the MapLibre map, and a table
-cross-referencing each site element to the userscript function that targets it. Sniffies is an
-**Angular 21 + MapLibre GL** app; never select on `_ngcontent-ng-cNNN` hashes (per-build).
-`SITE-INDEX.md` is a frozen snapshot reference — hand-maintained, not generated.
+For the **target site's** DOM/selectors/globals, see **`docs/sniffies-dom-and-api.md`** — a
+reverse-engineering reference built from a saved snapshot (`Sniffies App _ Map.html` + `_files/`)
+and the userscript's own observed behavior, every entry tagged OBSERVED or INFERRED. It documents
+the real Sniffies map DOM (marker structure, profile-ID encoding, attitude icons, `data-testid`
+inventory), `window.SNIFFIES` config, `/api/*` endpoints, the Socket.IO protocol, the MapLibre map,
+the auth model, and known gotchas. Sniffies is an **Angular 21 + MapLibre GL** app; never select on
+`_ngcontent-ng-cNNN` hashes (per-build). Read it before changing a selector or endpoint.
 
 ## Build / lint / test
 
@@ -101,10 +98,12 @@ workflow — do not look for or assume a separate source project. All changes go
 
 When changing the version, update all of these (they are not auto-synced):
 
-1. The **filename** (`...-<version>.txt`, currently `...-0.8.1.txt`).
+1. The **filename** (`...-<version>.txt`, currently the `0.12.1` shipped file).
 2. `// @version` header (line 4).
 3. `// @last-change` header date (line 5).
 4. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call (last line).
+
+(`package.json` is intentionally `0.0.0` and NOT a version-of-record — the `@version` header is.)
 
 ## Architecture (big picture)
 
@@ -161,5 +160,5 @@ The script exposes ~36 globals via `exposeGlobal(...)` for runtime inspection, a
 `__sniffiesBookmarks`, `__sniffiesAppointments`, `__sniffiesQuickPhrases`,
 `__sniffiesChatCaptureDebug`, `__sniffiesRescanChatAges`,
 `__sniffiesGetProfileTableData`, `__sniffiesTeardown` (stop all timers/observers). This is only a
-sample — grep `exposeGlobal(` (or see INDEX.md's Debug API tables) for the authoritative full list. Logging verbosity
+sample — grep `exposeGlobal(` for the authoritative full list. Logging verbosity
 is controlled by `currentLogVerbosity()` (quiet/normal/verbose).

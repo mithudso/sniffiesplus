@@ -1,39 +1,68 @@
 # Sniffies Plus
 
 A Tampermonkey/Greasemonkey userscript for [sniffies.com](https://sniffies.com) that adds soft
-profile filtering, chat-age badges, bookmarks, appointment reminders, quick-phrase intros, and
-optional Google Drive sync — all client-side, no server component.
+profile filtering (by attitude/position, profile text, and chat activity), chat-age badges,
+bookmarks, appointment reminders, quick-phrase intros, and optional Google Drive sync — all
+client-side, no server component.
+
+This repository holds the userscript, a small ES-module **interaction library** (`lib/`) built
+from the same observed site surface, and a dev test suite.
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) (or another userscript manager) in your browser.
-2. Open [`Sniffies Soft Filter (Bottom - Vers Bottom)-0.11.2.txt`](./Sniffies%20Soft%20Filter%20%28Bottom%20-%20Vers%20Bottom%29-0.11.2.txt), copy its contents, and create a new userscript in Tampermonkey with them (or point Tampermonkey directly at the raw file URL for auto-updates).
+1. Install [Tampermonkey](https://www.tampermonkey.net/) or Greasemonkey (4+ supported) in your
+   browser.
+2. Open the current `Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt`, copy its contents,
+   and create a new userscript with them.
 3. Reload [sniffies.com](https://sniffies.com) and click **"Show Filter"** (top-right launcher).
+
+Full steps, verification, and the Google-Drive-sync note are in
+[`docs/INSTALLATION.md`](docs/INSTALLATION.md).
 
 ## Documentation
 
-The userscript is entirely self-documenting: **lines 14–102 of the script itself** are an
-in-file README covering every user control, mouse/keyboard shortcut, the data model, and
-Google Drive sync notes. That block is the authoritative, always-current reference — read it
-before changing behavior. It is intentionally not duplicated here, since a copy would drift.
+| Doc | What it covers |
+|---|---|
+| In-file README (userscript lines ~14–110) | Authoritative, always-current: every control, shortcut, the data model, Drive sync. Read it before changing behavior. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Single-IIFE design, the deterministic `applyHiding` pipeline, data flow, storage model. |
+| [`docs/sniffies-dom-and-api.md`](docs/sniffies-dom-and-api.md) | The site reverse-engineering reference (DOM, endpoints, Socket.IO, auth). Read before changing a selector/endpoint. |
+| [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) · [`docs/TESTING.md`](docs/TESTING.md) | Setup, commands, workflow; test strategy and the CI gate. |
+| [`docs/SECURITY.md`](docs/SECURITY.md) · [`docs/logging.md`](docs/logging.md) · [`docs/external-calls.md`](docs/external-calls.md) | Threat model; logging approach; every external call. |
+| [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · [`docs/codebase-overview.md`](docs/codebase-overview.md) | Navigable maps of the code. |
+| [`lib/README.md`](lib/README.md) | The interaction library. |
+
+## The interaction library (`lib/`)
+
+An ES-module client for sniffies.com — **read via the API, write via the DOM** (Sniffies has no
+send-message API). It shares the userscript's rate-limit posture and is built from the observed
+surface documented above.
+
+```js
+import { createClient } from './lib/index.js';
+const client = createClient();
+const summary = await client.describe(['660dee38d1ac42d4']); // [{ id, attitude, lastActiveTs }]
+```
+
+Build the bundles with `npm run build:lib` (→ `dist/sniffies.esm.js` and the `window.Sniffies`
+IIFE `dist/sniffies.global.js`). See [`lib/README.md`](lib/README.md).
 
 ## Development
 
-This is a single hand-maintained `.txt` file with **no build step** — it ships as-is. The
-`package.json`/`test/` tooling here is dev-only (linting + a Vitest/jsdom test suite that boots
-the script's IIFE in memory); it never touches or modifies the shipped `.txt`.
+The userscript is a single hand-maintained `.txt` with **no build step** — it ships as-is. The
+`package.json`/`test/` tooling is dev-only and never modifies the shipped `.txt`.
 
-```
-npm install        # one-time
-npm test            # run the test suite
-npm run test:watch  # watch mode
-npm run lint         # correctness-focused lint (undefined refs, dupe keys, etc.)
+```sh
+npm install         # one-time
+npm run check       # lint + vitest (boots the IIFE) + lib tests + bundle-drift check
+npm test            # vitest only
+npm run test:lib    # node:test over lib/
+npm run build:lib   # regenerate dist/ from lib/
 ```
 
-See `CLAUDE.md` for the full architecture notes, storage conventions, and constraints (SES/lockdown
-compatibility, rate limiting, version-bump checklist) that apply when editing the script.
+See [`CLAUDE.md`](CLAUDE.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) for the architecture notes,
+storage conventions, SES/lockdown and rate-limit constraints, and the version-bump checklist that
+apply when editing the script.
 
 ## License
 
-No license has been chosen yet for this repository — all rights reserved by default until one is
-added.
+[MIT](LICENSE).
