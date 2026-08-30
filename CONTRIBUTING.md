@@ -11,11 +11,9 @@ are per-build and rot on the next deploy. Anchor on `data-testid`, structure, or
 
 ## What you are editing
 
-- The userscript is one hand-maintained file:
-  `Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt` (with `sniffiesplus.txt`
-  as a second shipped copy — CI tests both). There is **no build step** and no separate
-  source project; the `__spreadValues` / `__spreadProps` helpers at the top are
-  esbuild-style artifacts, not evidence of one. Edit the `.txt` directly.
+- The userscript is one hand-maintained file: `sniffiesplus.js`. There is **no build step**
+  and no separate source project; the `__spreadValues` / `__spreadProps` helpers at the top
+  are esbuild-style artifacts, not evidence of one. Edit `sniffiesplus.js` directly.
 - `lib/` is a small ES-module interaction library. It **does** build:
   `npm run build:lib` writes `dist/`. `dist/` is generated — edit `lib/`, never `dist/`.
 
@@ -29,17 +27,18 @@ npm run check      # lint + userscript suite + lib suite + build:check
 Run `npm run check` before opening a PR; CI runs the same thing. The pieces
 individually:
 
-- `npm test` — Vitest + jsdom. The harness reads the `.txt`, injects an
+- `npm test` — Vitest + jsdom. The harness reads `sniffiesplus.js`, injects an
   internals-export in memory (the file is never modified), and boots the IIFE.
 - `npm run test:lib` — `node:test` suite for `lib/`.
 - `npm run lint` — correctness-focused ESLint.
 - `npm run build:check` — rebuilds `dist/` and fails if it drifts from what's committed.
 
-## Version bumping touches 4 places
+## Version bumping touches 3 places
 
 They are not auto-synced. When changing the userscript version, update all of:
 
-1. The **filename** (`...-<version>.txt`).
-2. The `// @version` header (line 4).
-3. The `// @last-change` header date (line 5).
-4. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call.
+1. The `// @version` header (line 4).
+2. The `// @last-change` header date (line 5).
+3. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call.
+
+The version lives in the `@version` header, not the filename — git history is the version record.

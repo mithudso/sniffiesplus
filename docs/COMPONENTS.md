@@ -5,7 +5,7 @@ their key functions. It is deliberately not an API dump: for the exhaustive surf
 symbol name in the source (line numbers drift; the generated line-numbered `INDEX.md` lives
 outside the repo at `~/.claude/skill-consolidation/`).
 
-## Userscript (`Sniffies Soft Filter (…)-<version>.txt` / `sniffiesplus.txt`)
+## Userscript (`sniffiesplus.js`)
 
 One IIFE, ordered: tuning constants → storage load/save → crypto → engine → chat capture →
 UI panels → boot.

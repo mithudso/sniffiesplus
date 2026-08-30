@@ -9,13 +9,12 @@
   `GM_*` globals are missing. The script requests these grants:
   `GM_openInTab`, `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `unsafeWindow`.
 - Node 20 (`.nvmrc`) **only if you want to run the tests or build the library** — the
-  userscript itself is dependency-free and ships as-is.
+  userscript itself (`sniffiesplus.js`) is dependency-free and ships as-is.
 
 ## Install
 
-1. Open the current `Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt` in this
-   repository and copy its entire contents (it is JavaScript with a `// ==UserScript==`
-   header; only the file extension is `.txt`).
+1. Open `sniffiesplus.js` in this repository and copy its entire contents (it is JavaScript
+   with a `// ==UserScript==` header).
 2. In your manager: **Create a new script**, replace the template with the copied
    contents, save. (Or point Tampermonkey at the raw file URL for auto-updates.)
 3. Reload [sniffies.com](https://sniffies.com) and click **"Show Filter"** — the
@@ -61,7 +60,7 @@ npm run lint        # correctness-focused ESLint
 npm run check       # lint + tests + lib tests + build drift check
 ```
 
-The harness reads the `.txt` and injects an internals export **in memory** — the shipped
+The harness reads `sniffiesplus.js` and injects an internals export **in memory** — the shipped
 file is never modified.
 
 ## The `lib/` library (dev / embedding artifact)

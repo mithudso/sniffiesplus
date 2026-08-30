@@ -1,7 +1,7 @@
 # Development
 
-There is **no build step for the userscript** — the `.txt` ships as-is, and what you paste into
-Tampermonkey is what you reviewed. Everything under `package.json`, `test/`, `scripts/`, and
+There is **no build step for the userscript** — `sniffiesplus.js` ships as-is, and what you paste
+into Tampermonkey is what you reviewed. Everything under `package.json`, `test/`, `scripts/`, and
 `eslint.config.js` is dev-only tooling; the shipped script stays dependency-free.
 
 The only build in the repo is for the **interaction library**: `lib/*.js` (ES modules) concatenate
@@ -22,36 +22,36 @@ npm install    # one-time: vitest + jsdom + eslint (devDependencies)
 | `npm run test:watch` | `vitest` | Same, watch mode |
 | `npm run test:cov` | `vitest run --coverage` | Same plus v8 coverage (of the harness/test code — see TESTING.md) |
 | `npm run test:lib` | `node --test 'test/lib/*.test.mjs'` | Library suite: plain node:test, no jsdom, imports `lib/*.js` directly |
-| `npm run lint` | `eslint .` | Correctness-only lint: `no-undef`, dupe keys, unreachable code — over the `.txt` (as a browser script with GM globals), `lib/`, and the tooling. Style rules are deliberately off. |
+| `npm run lint` | `eslint .` | Correctness-only lint: `no-undef`, dupe keys, unreachable code — over `sniffiesplus.js` (as a browser script with GM globals), `lib/`, and the tooling. Style rules are deliberately off. |
 | `npm run build:lib` | `node scripts/build-lib.mjs` | Rebuild `dist/` from `lib/` |
 | `npm run build:check` | build + `git diff --exit-code -- dist/` | Fails if `dist/` drifted from `lib/` source |
 | `npm run check` | lint + test + test:lib + build:check | The full gate — run this before committing |
 
 ## Quick syntax check
 
-Node refuses `node --check` on a bare `.txt`, so copy first:
+The userscript is a `.js` file, so `node --check` works directly:
 
 ```sh
-cp 'Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt' /tmp/sf.js && node --check /tmp/sf.js
+node --check sniffiesplus.js
 ```
 
 ## Pointing the tests at a specific source file
 
-The harness resolves the userscript by scanning the repo root for
-`Sniffies Soft Filter *.txt` and picking the **highest semver in the filename** (a plain string
-sort would rank `0.11.0` before `0.8.2`). To test any other variant, override with
+The harness defaults to `sniffiesplus.js`. To test any other exported variant, override with
 `SNIFFIES_SRC_FILE`:
 
 ```sh
-SNIFFIES_SRC_FILE=sniffiesplus.txt npm test
+SNIFFIES_SRC_FILE=some-other-file.js npm test
 ```
 
-Feature-gated suites (`temp-block`, `carousel-hotkeys`) skip rather than fail against a source
-variant that lacks the feature, so the skip count tells you what the target is missing.
+`sniffiesplus.js` contains the temp-block and cruiser-carousel features, so the `temp-block` and
+`carousel-hotkeys` suites run and pass against it. They still wrap their assertions in
+`describe.skipIf` as belt-and-suspenders, so against a variant that lacks a feature they skip
+rather than fail — the skip count then tells you what that target is missing.
 
 ## The loop
 
-1. Edit the `.txt` directly — it is the canonical source. The `__spreadValues`/`__spreadProps`
+1. Edit `sniffiesplus.js` directly — it is the canonical source. The `__spreadValues`/`__spreadProps`
    helpers at the top look esbuild-generated, but there is no upstream source project; do not go
    looking for one.
 2. `npm run check` (or at minimum `npm test` + `npm run lint`).
@@ -63,21 +63,21 @@ variant that lacks the feature, so the skip count tells you what the target is m
       e.g. `__sniffiesMemoryStats`, `__sniffiesChatCaptureDebug`, `__sniffiesBookmarks`,
       `__sniffiesTeardown`. Grep `exposeGlobal(` for the full list (~38 of them).
 
-## Version bumping touches 4 places
+## Version bumping touches 3 places
 
 They are not auto-synced. When changing the version, update all of:
 
-1. The **filename** (`...-<version>.txt`).
-2. The `// @version` header (line 4).
-3. The `// @last-change` header date (line 5).
-4. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call (last line of the IIFE).
+1. The `// @version` header (line 4).
+2. The `// @last-change` header date (line 5).
+3. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call (last line of the IIFE).
+
+The version lives in the `@version` header, not the filename — git history is the version record.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `Sniffies Soft Filter (…)-<version>.txt` | the canonical userscript (highest version wins) |
-| `sniffiesplus.txt` | a variant of the same IIFE; test it via `SNIFFIES_SRC_FILE` |
+| `sniffiesplus.js` | the canonical userscript (one IIFE) |
 | `lib/` | the ES-module interaction library (see `lib/README.md`) |
 | `dist/` | generated library bundles — never edit |
 | `scripts/build-lib.mjs` | the library build (concat + drift guards) |

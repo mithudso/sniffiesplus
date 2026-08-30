@@ -17,13 +17,11 @@ Two suites, two harnesses, on purpose:
 
 ## How the IIFE becomes testable (`test/harness.mjs`)
 
-The userscript is one IIFE with no exports, and the `.txt` on disk is **never modified**. The
-harness makes it testable entirely in memory:
+The userscript is one IIFE with no exports, and `sniffiesplus.js` on disk is **never modified**.
+The harness makes it testable entirely in memory:
 
-1. **Resolve the source.** Scan the repo root for `Sniffies Soft Filter *.txt` and pick the
-   highest semver embedded in the filename (a lexicographic sort would rank `0.11.0` before
-   `0.8.2` and silently test a stale file). `SNIFFIES_SRC_FILE=<name> npm test` overrides the
-   resolution to target any variant (e.g. `sniffiesplus.txt`).
+1. **Resolve the source.** Default to `sniffiesplus.js`. `SNIFFIES_SRC_FILE=<name> npm test`
+   overrides the resolution to target any other exported variant.
 2. **Derive the surface.** `topLevelFunctionNames()` regex-scans the source for every 2-space-
    indented top-level `function` — direct children of the IIFE. New functions are picked up
    automatically; nothing is registered by hand.
@@ -49,8 +47,8 @@ harness makes it testable entirely in memory:
 Meaningful coverage of the important and the changed/risky paths, with real behavioral
 assertions — **not** a blanket line-percentage mandate. A line target on this codebase would
 reward tests that execute DOM code against stubs and assert nothing. Accordingly,
-`vitest.config.js` scopes v8 coverage to `test/**`: the `.txt` isn't an imported module, so line
-coverage of it would be noise. When you add a top-level function, the harness and smoke test pick
+`vitest.config.js` scopes v8 coverage to `test/**`: `sniffiesplus.js` isn't an imported module, so
+line coverage of it would be noise. When you add a top-level function, the harness and smoke test pick
 it up automatically; add behavioral assertions wherever the logic is non-trivial.
 
 ## What the suite covers
@@ -78,11 +76,12 @@ it up automatically; add behavioral assertions wherever the logic is non-trivial
 
 ### Feature-gated suites
 
-`temp-block.test.mjs` and `carousel-hotkeys.test.mjs` cover features that shipped in v0.12.0.
-Each probes the booted internals for its feature function (`pruneExpiredTempBlocks`,
-`getCruiserCarouselIds`) and wraps its suites in `describe.skipIf` — so against an older source
-variant (or an explicit `SNIFFIES_SRC_FILE` target) they **skip instead of fail**, and the skip
-count reports which features the target lacks.
+`temp-block.test.mjs` and `carousel-hotkeys.test.mjs` cover the temp-block and cruiser-carousel
+features. `sniffiesplus.js` contains both, so both suites **run and pass** against the default
+source. Each still probes the booted internals for its feature function (`pruneExpiredTempBlocks`,
+`getCruiserCarouselIds`) and wraps its suites in `describe.skipIf` as belt-and-suspenders — so
+against an `SNIFFIES_SRC_FILE` variant that lacks a feature they **skip instead of fail**, and the
+skip count reports which features that target lacks.
 
 ## Cold-cache global setup
 
@@ -98,5 +97,5 @@ runs are unaffected.
 `.github/workflows/ci.yml` runs on every push and pull request: `npm ci` → `npm run lint` →
 `npm test`. The library tests and the `dist/` drift check are part of the local gate —
 `npm run check` (lint + vitest + `test:lib` + `build:check`) — which is the command to run before
-committing; CI does not yet include those two steps. The shipped `.txt` is unaffected by any of
-this tooling.
+committing; CI does not yet include those two steps. The shipped `sniffiesplus.js` is unaffected
+by any of this tooling.

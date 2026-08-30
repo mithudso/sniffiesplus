@@ -19,14 +19,13 @@ badges, bookmarks, appointment reminders, quick-phrase intros, and optional Goog
 sync. There is no application server and no module system — the whole program is one IIFE
 that runs in the page.
 
-The entire codebase is one file:
+The entire userscript is one file:
 
 ```
-Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt   # ~12,500 lines, one IIFE
-sniffiesplus.txt                                            # the working/optimization variant
+sniffiesplus.js   # ~12,900 lines, one IIFE; version lives in the @version header, not the filename
 ```
 
-The filename ends in `.txt` (not `.js`) but the content is JavaScript with a
+The file is JavaScript with a
 `// ==UserScript==` metadata header. A small ES-module **interaction library** now lives under
 `lib/` (built from the same observed surface); see `lib/README.md`.
 
@@ -53,8 +52,9 @@ the auth model, and known gotchas. Sniffies is an **Angular 21 + MapLibre GL** a
 
 ## Build / lint / test
 
-There is **no build step** — the `.txt` ships as-is. Quick syntax check: copy to a `.js` name
-first (Node refuses `node --check` on a bare `.txt`): `cp '<file>.txt' /tmp/sf.js && node --check /tmp/sf.js`.
+There is **no build step** for the userscript — `sniffiesplus.js` ships as-is. Syntax check
+directly: `node --check sniffiesplus.js`. (There is a build for the `lib/` interaction library:
+`npm run build:lib` → `dist/`.)
 
 **Automated tests** (dev-only; the userscript itself stays dependency-free):
 
@@ -64,8 +64,8 @@ npm test           # run the suite once
 npm run test:watch # watch mode
 ```
 
-- The script is one IIFE with no exports, so `test/harness.mjs` reads the `.txt`, injects an
-  internals-export before the IIFE close (in memory — **the `.txt` is never modified**), and
+- The script is one IIFE with no exports, so `test/harness.mjs` reads `sniffiesplus.js`, injects an
+  internals-export before the IIFE close (in memory — **the file is never modified**), and
   `test/setup.mjs` boots it once per file in jsdom + WebCrypto + GM/fetch mocks + fake timers.
   Tests then call internals via `getInternals()`.
 - `test/*.test.mjs`: behavioral suites (parsing, filter predicates, chat-activity, crypto,
@@ -87,21 +87,21 @@ npm run test:watch # watch mode
 4. Use the `window.__sniffies*` debug globals (below) from the browser console to inspect
    runtime state.
 
-## This `.txt` is the canonical source — edit it directly
+## `sniffiesplus.js` is the canonical source — edit it directly
 
 This is a personally-maintained script with **no upstream source**; the owner hand-edits
-this single `.txt` directly. The `__spreadValues` / `__spreadProps` helpers at the top (and
-the sparse inline comments) are esbuild-style artifacts, but there is no build step in this
-workflow — do not look for or assume a separate source project. All changes go in this file.
+`sniffiesplus.js` directly. The `__spreadValues` / `__spreadProps` helpers at the top (and
+the sparse inline comments) are esbuild-style artifacts, but there is no build step for the
+userscript — do not look for or assume a separate source project. All changes go in this file.
 
-## Version bumping touches 4 places
+## Version bumping touches 3 places
 
-When changing the version, update all of these (they are not auto-synced):
+The filename is stable (`sniffiesplus.js`) — git history is the version record. When changing the
+version, update all of these (not auto-synced):
 
-1. The **filename** (`...-<version>.txt`, currently the `0.12.1` shipped file).
-2. `// @version` header (line 4).
-3. `// @last-change` header date (line 5).
-4. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call (last line).
+1. `// @version` header (line 4).
+2. `// @last-change` header date (line 5).
+3. The final `logInfo("Sniffies soft filter loaded (vX.Y.Z)")` call (last line).
 
 (`package.json` is intentionally `0.0.0` and NOT a version-of-record — the `@version` header is.)
 

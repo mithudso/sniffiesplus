@@ -12,8 +12,7 @@ from the same observed site surface, and a dev test suite.
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) or Greasemonkey (4+ supported) in your
    browser.
-2. Open the current `Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt`, copy its contents,
-   and create a new userscript with them.
+2. Open `sniffiesplus.js`, copy its contents, and create a new userscript with them.
 3. Reload [sniffies.com](https://sniffies.com) and click **"Show Filter"** (top-right launcher).
 
 Full steps, verification, and the Google-Drive-sync note are in
@@ -48,8 +47,8 @@ IIFE `dist/sniffies.global.js`). See [`lib/README.md`](lib/README.md).
 
 ## Development
 
-The userscript is a single hand-maintained `.txt` with **no build step** — it ships as-is. The
-`package.json`/`test/` tooling is dev-only and never modifies the shipped `.txt`.
+The userscript is a single hand-maintained `sniffiesplus.js` with **no build step** — it ships
+as-is. The `package.json`/`test/` tooling is dev-only and never modifies the shipped file.
 
 ```sh
 npm install         # one-time
