@@ -1,14 +1,19 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.12.2
-// @last-change  2026-08-30 00:00:00 EDT
+// @version      0.13.0
+// @last-change  2026-08-30 12:00:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
+// @match        https://www.sniffies.com/*
 // @grant        GM_openInTab
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM.openInTab
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.deleteValue
 // @grant        unsafeWindow
 // ==/UserScript==
 
@@ -51,10 +56,10 @@ Primary controls:
 Map/profile shortcuts:
   - Shift + left-click marker: hide/unhide profile (block toggle).
   - Middle-click map marker: hide profile.
-  - Cmd + middle-click map marker or Global Chat message: hide for a set
-    duration (default 24h, configurable in the filter panel as "Cmd+middle-
-    click hide duration"), then auto-unhide (vs. a plain middle-click, which
-    hides permanently).
+  - Cmd + middle-click (Ctrl + middle-click on Windows/Linux) on a map marker
+    or Global Chat message: hide for a set duration (default 24h, configurable
+    in the filter panel as "Cmd+middle-click hide duration"), then auto-unhide
+    (vs. a plain middle-click, which hides permanently).
   - Middle-click a Global Chat message: hide/block that message's author (they
     and their messages stop appearing in Global Chat, same as the map).
   - Middle-click chat window: send random intro phrase.
@@ -71,6 +76,12 @@ Keyboard hotkeys:
   - f (outside a chat): send a random greeting to the currently open profile.
   All hotkeys ignore modifier-key combos and never fire while typing in an
   input, textarea, or contenteditable field, so they won't clobber typing.
+
+Touch devices (phones/tablets — no middle button, no hover, no hotkeys):
+  - Long-press (600ms, finger held still) on a map marker or Global Chat
+    message: hide/block, same as a desktop middle-click. A drag/pan cancels it.
+  - Panels go full-width on small screens and can be scrolled; drag handles
+    still work by touch.
 
 Panels:
   - Include Matches: shows include keyword matches.
@@ -1259,6 +1270,56 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       font-size: 11px;
       color: rgba(255,255,255,.72);
     }
+    /* ---- Cross-browser / mobile adjustments ---------------------------------------------- */
+    /* Drag handles: without touch-action:none the browser claims the gesture for scrolling and
+       fires pointercancel mid-drag, so panels can't be moved by touch (iOS/Android). The soft
+       panel's handle is its FIRST .row (see buildPanel/makePanelDraggable), not a .head. */
+    .sniffies-soft-panel > .row:first-child,
+    .sniffies-match-panel .head,
+    .sniffies-bookmarks-panel .head,
+    .sniffies-appointments-panel .head {
+      touch-action: none;
+    }
+    /* Kill the grey tap flash on the script's own controls (iOS Safari / Android Chrome family). */
+    .sniffies-soft-panel button, .sniffies-soft-panel-launcher, .sniffies-match-panel button,
+    .sniffies-bookmarks-panel button, .sniffies-appointments-panel button,
+    .sniffies-chat-phrases-panel button, .sniffies-chat-phrases-launcher {
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Dynamic-viewport units: 100vh on mobile includes the collapsing URL bar, so panels sized
+       against it can extend under the browser chrome. dvh tracks the real visible height; the
+       @supports guard leaves older engines (pre-2022 Safari/Firefox) on the vh fallback.
+       (The soft panel is excluded on purpose: updateSoftPanelViewportBounds sizes it inline from
+       the visual viewport, which beats any stylesheet rule.) */
+    @supports (max-height: 100dvh) {
+      .sniffies-chat-phrases-panel { max-height: 52dvh; }
+      .sniffies-match-panel { max-height: 46dvh; }
+      .sniffies-appointments-panel { max-height: 52dvh; }
+      .sniffies-bookmarks-panel { max-height: 56dvh; }
+    }
+    /* Small screens: clamp fixed panel widths to the viewport (minus a margin) and respect the
+       iOS safe-area notch/home-indicator insets. */
+    @media (max-width: 480px) {
+      /* .sniffies-notes-modal is deliberately absent: that class is the full-screen dimming
+         backdrop (its dialog box, .sniffies-notes-modal-content, is already width:90% capped). */
+      .sniffies-soft-panel,
+      .sniffies-match-panel,
+      .sniffies-bookmarks-panel,
+      .sniffies-appointments-panel,
+      .sniffies-chat-phrases-panel {
+        width: auto !important;
+        max-width: calc(100vw - 16px) !important;
+        left: 8px !important;
+        right: 8px !important;
+      }
+      .sniffies-soft-panel {
+        padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+      }
+      .sniffies-soft-panel-launcher {
+        right: calc(12px + env(safe-area-inset-right, 0px));
+        top: calc(12px + env(safe-area-inset-top, 0px));
+      }
+    }
     .sniffies-profile-reminder-btn {
       font-size: 11px !important;
       line-height: 1.15 !important;
@@ -2087,6 +2148,21 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       if (!t || seen.has(t)) continue;
       seen.add(t);
       try {
+        // Firefox (Gecko) wraps unsafeWindow in Xray membranes: a plain assignment of a sandbox
+        // function/object either throws or lands as an opaque, useless wrapper on the page side.
+        // Gecko sandboxes provide exportFunction/cloneInto for exactly this; Chromium engines
+        // (Chrome/Edge/Opera, where the sandbox shares the page realm) don't define them and take
+        // the plain-assignment path unchanged.
+        if (t !== window && t !== globalThis && typeof unsafeWindow !== "undefined" && t === unsafeWindow) {
+          if (typeof value === "function" && typeof exportFunction === "function") {
+            exportFunction(value, t, { defineAs: name });
+            continue;
+          }
+          if (value && typeof value === "object" && typeof cloneInto === "function") {
+            t[name] = cloneInto(value, t, { cloneFunctions: true });
+            continue;
+          }
+        }
         t[name] = value;
       } catch (e) {
       }
@@ -2407,7 +2483,11 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (!panel2) return;
     const rect = panel2.getBoundingClientRect();
     const top = Math.max(0, Math.round(rect.top));
-    const available = Math.max(240, window.innerHeight - top - 12);
+    // visualViewport (when present) tracks the REAL visible height on mobile — iOS/Android shrink
+    // it when the on-screen keyboard opens, while window.innerHeight often stays stale; desktop
+    // browsers report the same value either way.
+    const viewportH = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    const available = Math.max(240, Math.round(viewportH) - top - 12);
     panel2.style.maxHeight = `${available}px`;
   }
   // Apply saved appointment-panel position (clears both right and bottom).
@@ -7152,18 +7232,25 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     collectRoots(pickChatMessageContainer());
     return chatWindowRoots.some((root) => root === target || root.contains(target));
   }
+  // True when the event carries the temp-block modifier: Cmd on macOS, Ctrl on Windows/Linux
+  // (Opera/Edge/Firefox users there have no practical Cmd key; Ctrl+middle-click has no competing
+  // browser binding once the middle-click itself is suppressed).
+  function isTempBlockModifier(e) {
+    return !!(e && (e.metaKey || e.ctrlKey));
+  }
   // Middle-mousedown handler: inside a chat window it fires an auto-intro for the conversation's profile; elsewhere it hides the marker.
   // Resolves the id via marker element / map hit-test; suppresses the event fully and reports 'Already hidden' when no change.
-  // Cmd (metaKey) held while middle-clicking makes the hide temporary (state.tempBlockHours,
-  // default 24h, configurable in the filter panel) instead of permanent -- the profile reappears
-  // on its own once pruneExpiredTempBlocks() expires it.
+  // Cmd (metaKey) — or Ctrl on Windows/Linux, where the Cmd/Meta key is impractical — held while
+  // middle-clicking makes the hide temporary (state.tempBlockHours, default 24h, configurable in
+  // the filter panel) instead of permanent -- the profile reappears on its own once
+  // pruneExpiredTempBlocks() expires it.
   function handleMiddleMark(e) {
     if (shouldLog("verbose")) log("→ handleMiddleMark", traceArgs(arguments));
     // button === 1 is the middle mouse button; ignore all other buttons/events.
     if (!e || e.type !== "mousedown" || e.button !== 1) return;
     const target = e.target instanceof Element ? e.target : null;
     if (!target) return;
-    const expiresAtMs = e.metaKey ? now() + tempBlockDurationMs() : null;
+    const expiresAtMs = isTempBlockModifier(e) ? now() + tempBlockDurationMs() : null;
     // Global Chat: middle-click a message hides/blocks its author, same as a map-marker middle-click,
     // instead of falling into the chat-window auto-intro branch below. /global-chat satisfies
     // isChatRoute() too, so without this check first, a middle-click on a message here would be
@@ -8188,6 +8275,108 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Registered through addTrackedListener so teardownSniffies() can remove every one with the
   // same capture flag it was added with (previously none were removed on teardown).
+  // ---- Touch fallback: long-press = middle-click (mobile has no middle button) ----------------
+  // On coarse-pointer devices (phones/tablets: iOS Safari via the Userscripts app, Firefox for
+  // Android, Kiwi/Edge Android), a 600ms movement-cancelled long-press on a map marker or a
+  // Global Chat message performs the same hide/block a middle-click does on desktop. It feeds
+  // handleMiddleMark a synthetic mousedown so the two paths can never drift.
+  const LONG_PRESS_MS = 600;
+  const LONG_PRESS_MOVE_TOLERANCE_PX = 12;
+  const LONG_PRESS_CONTEXTMENU_SWALLOW_MS = 700;
+  let longPressTimer = 0;
+  let longPressStart = null;
+  let longPressFiredAt = 0;
+  let longPressFiredTarget = null;
+  function isCoarsePointerDevice() {
+    try {
+      return !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    } catch (e) {
+      return false;
+    }
+  }
+  function cancelLongPress() {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = 0;
+    }
+    longPressStart = null;
+  }
+  function handleLongPressPointerDown(e) {
+    if (!e || (e.pointerType !== "touch" && e.pointerType !== "pen")) return;
+    if (!isCoarsePointerDevice()) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target) return;
+    // Only arm over things a middle-click would act on — markers and Global Chat messages —
+    // never the script's own panels.
+    const actable = target.closest(".maplibregl-marker, .marker-avatar, .marker-avatar-image, .marker-container, [data-testid='cv-marker-container'], [data-testid='globalChat-message']");
+    if (!actable || target.closest(NAV_PANEL_SKIP_SELECTOR)) return;
+    cancelLongPress();
+    longPressStart = { x: e.clientX, y: e.clientY, target };
+    longPressTimer = setTimeout(() => {
+      longPressTimer = 0;
+      const start = longPressStart;
+      longPressStart = null;
+      if (!start) return;
+      longPressFiredAt = now();
+      longPressFiredTarget = start.target;
+      handleMiddleMark({
+        type: "mousedown",
+        button: 1,
+        target: start.target,
+        clientX: start.x,
+        clientY: start.y,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault() {},
+        stopPropagation() {},
+        stopImmediatePropagation() {}
+      });
+    }, LONG_PRESS_MS);
+  }
+  function handleLongPressPointerMove(e) {
+    if (!longPressStart) return;
+    // A drag/pan is not a long-press: cancel once the finger moves past the tolerance.
+    if (Math.hypot(e.clientX - longPressStart.x, e.clientY - longPressStart.y) > LONG_PRESS_MOVE_TOLERANCE_PX) cancelLongPress();
+  }
+  function handleLongPressEnd() {
+    cancelLongPress();
+  }
+  // True while we're inside the post-long-press suppression window (time-bounded, so later
+  // legitimate events are never eaten). Both follow-through events check it independently —
+  // Android fires contextmenu on long-press, iOS fires a click on finger lift — and neither
+  // zeroes the window, since either or both may arrive per platform.
+  function inLongPressSwallowWindow() {
+    return !!longPressFiredAt && now() - longPressFiredAt <= LONG_PRESS_CONTEXTMENU_SWALLOW_MS;
+  }
+  function swallowEvent(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+  }
+  // Android: swallow the long-press contextmenu so the browser menu doesn't stack on the hide.
+  function handleLongPressContextMenu(e) {
+    if (!inLongPressSwallowWindow()) return;
+    swallowEvent(e);
+  }
+  // iOS (and some Android cases): a click still fires on finger lift after the hold — the desktop
+  // path preventDefaults the real mousedown, but a synthetic long-press can't. Swallow the click
+  // only when it lands inside the element we just acted on, so the site's own tap handler doesn't
+  // open the profile we just hid.
+  function handleLongPressClick(e) {
+    if (!inLongPressSwallowWindow()) return;
+    const target = e.target instanceof Element ? e.target : null;
+    const pressed = longPressFiredTarget;
+    if (!target || !pressed) return;
+    if (target === pressed || (pressed.contains && pressed.contains(target)) || (target.contains && target.contains(pressed))) {
+      swallowEvent(e);
+    }
+  }
+  addTrackedListener(document, "pointerdown", handleLongPressPointerDown, true);
+  addTrackedListener(document, "pointermove", handleLongPressPointerMove, true);
+  addTrackedListener(document, "pointerup", handleLongPressEnd, true);
+  addTrackedListener(document, "pointercancel", handleLongPressEnd, true);
+  addTrackedListener(document, "contextmenu", handleLongPressContextMenu, true);
+  addTrackedListener(document, "click", handleLongPressClick, true);
   addTrackedListener(document, "mousedown", handleShiftBlock, true);
   // Capture-phase listener (true) so the script intercepts the shift-right-click before the page.
   addTrackedListener(document, "mousedown", handleShiftRightAutoMessageDown, true);
@@ -11691,6 +11880,13 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     });
     if (!softPanelViewportResizeBound) {
       addTrackedListener(window, "resize", () => updateSoftPanelViewportBounds(panel2), false);
+      // On iOS Safari / Chrome Android the on-screen keyboard resizes only the VISUAL viewport —
+      // window fires no resize — so the recompute must also hang off visualViewport itself.
+      try {
+        if (window.visualViewport) {
+          addTrackedListener(window.visualViewport, "resize", () => updateSoftPanelViewportBounds(panel2), false);
+        }
+      } catch (e) {}
       softPanelViewportResizeBound = true;
     }
     const enabled = panel2.querySelector("#sfEnabled");
@@ -12938,5 +13134,5 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.12.2)");
+  logInfo("Sniffies soft filter loaded (v0.13.0)");
 })();

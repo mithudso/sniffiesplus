@@ -67,6 +67,7 @@ Edit `lib/`, then `npm run build:lib`.
 | `logging.md` | Logging approach, levels, sensitive-data rules. |
 | `INSTALLATION.md` | Prerequisites, install, verification. |
 | `external-calls.md` | Inventory of every external call with auth/timeout/rate-limit/retry. |
+| `browser-compatibility.md` | Per-browser/manager support matrix and the engine quirks the code handles (Firefox Xray, GM4 fallbacks, Safari viewport, mobile long-press). |
 | `high_signal_file_index.json` | Machine-readable twin of this file. |
 
 ## `test/`
@@ -86,5 +87,6 @@ is never modified). `test/lib/*.test.mjs` run under **node:test** against the li
 | `chat-activity.test.mjs`, `chat-capture-parse.test.mjs`, `global-chat.test.mjs` | Chat-activity derivation, payload capture parsing, global-chat hiding. |
 | `crypto.test.mjs`, `storage-migration.test.mjs`, `memory-gc.test.mjs` | Export encryption, versioned-key migration + fallback legs, memory GC. |
 | `sanitizers.test.mjs`, `rate-limit.test.mjs`, `oauth-callback.test.mjs`, `not-online-window.test.mjs`, `trace-redactor.test.mjs` | URL/message sanitizers, the request limiter, the OAuth-callback parser, the not-online window, the leak-resistant trace redactor. |
+| `touch-longpress.test.mjs` | The mobile long-press = middle-click fallback (arm/fire/cancel, contextmenu swallow) and the Cmd/Ctrl temp-block modifier. |
 | `temp-block.test.mjs`, `carousel-hotkeys.test.mjs` | Temp-block and cruiser-carousel features; run and pass against `sniffiesplus.js`. `describe.skipIf` skips them against an `SNIFFIES_SRC_FILE` variant that lacks the feature. |
 | `lib/*.test.mjs` | node:test suites for the interaction library. |

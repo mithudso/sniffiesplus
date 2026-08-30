@@ -24,6 +24,9 @@ export default [
         GM_openInTab: "readonly",
         GM: "readonly",
         unsafeWindow: "readonly",
+        // Firefox (Gecko) sandbox helpers for crossing the Xray boundary; typeof-guarded in source.
+        exportFunction: "readonly",
+        cloneInto: "readonly",
         chrome: "readonly", // present when hosted as a Chrome extension / via Tampermonkey (typeof-guarded in source)
       },
     },

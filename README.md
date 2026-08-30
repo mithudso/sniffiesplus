@@ -16,7 +16,10 @@ from the same observed site surface, and a dev test suite.
 3. Reload [sniffies.com](https://sniffies.com) and click **"Show Filter"** (top-right launcher).
 
 Full steps, verification, and the Google-Drive-sync note are in
-[`docs/INSTALLATION.md`](docs/INSTALLATION.md).
+[`docs/INSTALLATION.md`](docs/INSTALLATION.md). Works on Chrome, Edge, Opera, Firefox, Safari
+(macOS + iOS via the Userscripts app), and Android extension-capable browsers — including touch
+support (long-press = middle-click). Per-browser managers and quirks:
+[`docs/browser-compatibility.md`](docs/browser-compatibility.md).
 
 ## Documentation
 
