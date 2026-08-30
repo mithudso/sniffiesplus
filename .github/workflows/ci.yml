@@ -21,8 +21,6 @@ jobs:
         run: npm run lint
       - name: Unit tests (vitest + jsdom, boots the userscript IIFE)
         run: npm test
-      - name: Userscript boots against the plus variant too
-        run: SNIFFIES_SRC_FILE=sniffiesplus.txt npm test
       - name: Library tests (node:test over lib/)
         run: npm run test:lib
       - name: Library bundles are current (dist/ rebuilt from lib/)

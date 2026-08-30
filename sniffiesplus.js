@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.11.4
+// @version      0.12.2
 // @last-change  2026-08-30 00:00:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
@@ -51,6 +51,10 @@ Primary controls:
 Map/profile shortcuts:
   - Shift + left-click marker: hide/unhide profile (block toggle).
   - Middle-click map marker: hide profile.
+  - Cmd + middle-click map marker or Global Chat message: hide for a set
+    duration (default 24h, configurable in the filter panel as "Cmd+middle-
+    click hide duration"), then auto-unhide (vs. a plain middle-click, which
+    hides permanently).
   - Middle-click a Global Chat message: hide/block that message's author (they
     and their messages stop appearing in Global Chat, same as the map).
   - Middle-click chat window: send random intro phrase.
@@ -62,6 +66,9 @@ Keyboard hotkeys:
   - c (outside a chat): toggle the Chats list panel.
   - n (inside a chat, text field not focused): jump to next unread chat.
   - b (inside a chat, text field not focused): jump to previous unread chat.
+  - Right/Left arrow (outside a chat): step to the next/previous profile in
+    the cruiser-card browse carousel (opens it if collapsed).
+  - f (outside a chat): send a random greeting to the currently open profile.
   All hotkeys ignore modifier-key combos and never fire while typing in an
   input, textarea, or contenteditable field, so they won't clobber typing.
 
@@ -239,6 +246,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   const STATE_KEYS = ["sniffiesSoftFilterState_v2", "sniffiesSoftFilterState_v1", "sniffiesSoftFilterState"];
   const BLOCKED_KEYS = ["sniffiesSoftFilterBlocked_v2", "sniffiesSoftFilterBlocked_v1", "sniffiesSoftFilterBlocked"];
   const BLOCKED_AT_KEYS = ["sniffiesSoftFilterBlockedAt_v1"];
+  const TEMP_BLOCK_EXPIRES_KEYS = ["sniffiesSoftFilterTempBlockExpiresAt_v1"];
   const ICON_RULES_KEYS = ["sniffiesSoftFilterIconRules_v2", "sniffiesSoftFilterIconRules_v1", "sniffiesSoftFilterIconRules"];
   const MANUAL_ATT_KEYS = ["sniffiesSoftFilterManualAtt_v1"];
   const RATE_KEY = "sniffiesSoftFilterRate_v1";
@@ -306,6 +314,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     showOnlyChats: false,
     hideNotOnline2h: false,
     notOnlineWindowMinutes: 120,
+    // Cmd+middle-click hide duration in hours (see hideProfileNow's expiresAtMs / TEMP_BLOCK_HOURS_DEFAULT).
+    tempBlockHours: 24,
     // Auto-hide a profile after you've sent UNANSWERED_OUT_HIDE_THRESHOLD (4) messages
     // with no reply, until they reply. Default on. Read via '!== false' so old saved
     // states adopt it automatically on upgrade.
@@ -1606,6 +1616,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   state.quickPhraseSort = normalizedQuickPhraseSort(state.quickPhraseSort);
   let blocked = loadBlockedSet();
   let blockedAt = loadBlockedAtMap();
+  let tempBlockExpiresAt = loadTempBlockExpiresAtMap();
   let bookmarks = loadBookmarks();
   let iconRules = loadIconRules();
   let notes = loadNotes();
@@ -2493,6 +2504,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       // (24h — the presence-data retention). Invalid/missing values fall back to 120 (2h).
       const notOnlineWin = Math.round(Number(merged.notOnlineWindowMinutes));
       merged.notOnlineWindowMinutes = Number.isFinite(notOnlineWin) && notOnlineWin > 0 ? Math.min(Math.max(notOnlineWin, 1), 24 * 60) : 120;
+      // Coerce the configurable Cmd+middle-click hide duration to a positive integer of hours,
+      // clamped to 1..168 (1 hour to 7 days). Invalid/missing values fall back to 24.
+      const tempBlockHrs = Math.round(Number(merged.tempBlockHours));
+      merged.tempBlockHours = Number.isFinite(tempBlockHrs) && tempBlockHrs > 0 ? Math.min(Math.max(tempBlockHrs, 1), 168) : 24;
       return merged;
     };
     for (const k of STATE_KEYS) {
@@ -2590,6 +2605,60 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       if (blocked.has(id)) obj[id] = ts;
     }
     lsSetSafe(BLOCKED_AT_KEYS[0], JSON.stringify(obj));
+  }
+  // Load the temp-block-expiry-ms map (Cmd+middle-click hides only; plain middle-click blocks
+  // never appear here), keyed by TEMP_BLOCK_EXPIRES_KEYS[0]. Entries for ids no longer in
+  // `blocked` are dropped on load same as loadBlockedAtMap.
+  function loadTempBlockExpiresAtMap() {
+    if (shouldLog("verbose")) log("→ loadTempBlockExpiresAtMap", traceArgs(arguments));
+    const map = /* @__PURE__ */ new Map();
+    const raw = localStorage.getItem(TEMP_BLOCK_EXPIRES_KEYS[0]);
+    if (raw) {
+      try {
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj === "object") {
+          for (const [id, ts] of Object.entries(obj)) {
+            const normId = normalizeProfileId(id);
+            const at = parseTimestamp(ts);
+            if (normId && at) map.set(normId, at);
+          }
+        }
+      } catch (e) {
+      }
+    }
+    return map;
+  }
+  // Persist the temp-block-expiry-ms map, pruned to only ids currently in `blocked`.
+  function saveTempBlockExpiresAtMap() {
+    if (shouldLog("verbose")) log("→ saveTempBlockExpiresAtMap", traceArgs(arguments));
+    const obj = {};
+    for (const [id, ts] of tempBlockExpiresAt) {
+      if (blocked.has(id)) obj[id] = ts;
+    }
+    localStorage.setItem(TEMP_BLOCK_EXPIRES_KEYS[0], JSON.stringify(obj));
+  }
+  // Unblocks any id whose temp-block window (Cmd+middle-click) has elapsed. Called from the top of
+  // applyHiding() so both the map and Global Chat (which applyHiding calls through to) pick up the
+  // reappearance on the very next 2s sweep. No-op (and no persistence writes) when nothing expired.
+  function pruneExpiredTempBlocks() {
+    if (shouldLog("verbose")) log("→ pruneExpiredTempBlocks", traceArgs(arguments));
+    if (!tempBlockExpiresAt.size) return false;
+    const nowMs = now();
+    let changed = false;
+    for (const [id, expiresAt] of [...tempBlockExpiresAt]) {
+      if (nowMs >= expiresAt) {
+        tempBlockExpiresAt.delete(id);
+        blocked.delete(id);
+        blockedAt.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveBlockedSet();
+      saveBlockedAtMap();
+      saveTempBlockExpiresAtMap();
+    }
+    return changed;
   }
   // Normalize categories/tags: accept an array or a comma/newline-separated string; trim, case-insensitively dedupe, cap each to 40 chars and the list to 24 items.
   function normalizeTagValues(value) {
@@ -6461,6 +6530,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     // The async paths (updatePartials batch loop, scheduleMapRefresh) keep the default re-scan: the DOM can change
     // across their await/timer boundaries, so re-scanning there is intentional, not redundant.
     if (!alreadyScanned) scanMarkers();
+    pruneExpiredTempBlocks();
     // Master switch: when disabled the engine hides nothing. Re-show every marker and clear highlights, then
     // bail — otherwise exclude-text and the chat/online filters keep hiding while "Enabled" is off. Global chat
     // already short-circuits on !state.enabled, so this keeps map and global-chat behavior consistent.
@@ -6920,7 +6990,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Blocks a profile id now: adds to blocked set, records for undo, persists, and re-applies hiding.
   // Returns false if id is empty or already blocked; optionally tracks the supplied marker element.
-  function hideProfileNow(profileId, markerEl = null) {
+  // expiresAtMs (from Cmd+middle-click, see handleMiddleMark) makes this a temporary block that
+  // pruneExpiredTempBlocks() auto-unhides once it elapses; omit/null for a normal permanent block.
+  function hideProfileNow(profileId, markerEl = null, expiresAtMs = null) {
     if (shouldLog("verbose")) log("→ hideProfileNow", traceArgs(arguments));
     const id = normalizeProfileId(profileId);
     if (!id) return false;
@@ -6931,8 +7003,12 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (markerEl) idToMarker.set(id, resolveMarkerRoot(markerEl));
     saveBlockedSet();
     saveBlockedAtMap();
+    if (expiresAtMs) {
+      tempBlockExpiresAt.set(id, expiresAtMs);
+      saveTempBlockExpiresAtMap();
+    }
     applyHiding();
-    setStatus(`Hidden profile: ${id}`);
+    setStatus(expiresAtMs ? `Hidden profile for 24h: ${id}` : `Hidden profile: ${id}`);
     return true;
   }
   // Unblocks a profile id, persists the blocked set, and re-applies hiding. Returns false if id wasn't blocked.
@@ -6942,6 +7018,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (!id) return false;
     if (!blocked.has(id)) return false;
     blocked.delete(id);
+    if (tempBlockExpiresAt.delete(id)) saveTempBlockExpiresAtMap();
     blockedAt.delete(id);
     saveBlockedSet();
     saveBlockedAtMap();
@@ -7077,12 +7154,16 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   }
   // Middle-mousedown handler: inside a chat window it fires an auto-intro for the conversation's profile; elsewhere it hides the marker.
   // Resolves the id via marker element / map hit-test; suppresses the event fully and reports 'Already hidden' when no change.
+  // Cmd (metaKey) held while middle-clicking makes the hide temporary (state.tempBlockHours,
+  // default 24h, configurable in the filter panel) instead of permanent -- the profile reappears
+  // on its own once pruneExpiredTempBlocks() expires it.
   function handleMiddleMark(e) {
     if (shouldLog("verbose")) log("→ handleMiddleMark", traceArgs(arguments));
     // button === 1 is the middle mouse button; ignore all other buttons/events.
     if (!e || e.type !== "mousedown" || e.button !== 1) return;
     const target = e.target instanceof Element ? e.target : null;
     if (!target) return;
+    const expiresAtMs = e.metaKey ? now() + tempBlockDurationMs() : null;
     // Global Chat: middle-click a message hides/blocks its author, same as a map-marker middle-click,
     // instead of falling into the chat-window auto-intro branch below. /global-chat satisfies
     // isChatRoute() too, so without this check first, a middle-click on a message here would be
@@ -7092,7 +7173,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       e.preventDefault();
       e.stopPropagation();
       if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
-      const changed = hideProfileNow(globalChatMsgId);
+      const changed = hideProfileNow(globalChatMsgId, null, expiresAtMs);
       if (!changed) setStatus(`Already hidden: ${globalChatMsgId}`);
       return;
     }
@@ -7115,7 +7196,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     e.preventDefault();
     e.stopPropagation();
     if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
-    const changed = hideProfileNow(id, markerEl);
+    const changed = hideProfileNow(id, markerEl, expiresAtMs);
     if (!changed) {
       const normalizedId = normalizeProfileId(id);
       if (normalizedId && blocked.has(normalizedId)) {
@@ -8019,19 +8100,80 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       return false;
     }
   }
-  // keydown handler for single-key nav: g=Global Chat, c=Chats list, n/b=next/prev unread.
-  // Ignored while typing, with modifiers, or on key repeat; g/c only fire off a chat route, n/b only on one. Prevents default when it acts.
+  // Ids (DOM order) of every cruiser-card currently rendered in the bottom-of-map browse carousel.
+  // The site destroys these nodes via *ngIf while the carousel is collapsed (see
+  // ensureCruiserCarouselOpen), so this is only meaningful once it's open.
+  function getCruiserCarouselIds() {
+    if (shouldLog("verbose")) log("→ getCruiserCarouselIds", traceArgs(arguments));
+    return Array.from(document.querySelectorAll('[data-testid="cruiserCard"]')).map((el) => normalizeProfileId(el.id)).filter(Boolean);
+  }
+  // Opens the cruiser-card carousel if it's currently collapsed and waits out its render, since its
+  // cards don't exist in the DOM until then. Resolves immediately (no wait) if already open.
+  function ensureCruiserCarouselOpen() {
+    if (shouldLog("verbose")) log("→ ensureCruiserCarouselOpen", traceArgs(arguments));
+    const header = document.querySelector('[data-testid="cruiserCardHeader"]');
+    if (!header) return Promise.resolve(false);
+    if (!header.classList.contains("closed")) return Promise.resolve(true);
+    header.click();
+    return new Promise((resolve) => setTimeout(() => resolve(true), 400));
+  }
+  // Steps to the next/previous profile in the browse carousel relative to whichever profile is
+  // currently open (direction: +1/-1), and navigates there by clicking its card (preserving the
+  // site's own SPA routing/animation, unlike a raw location change). Wraps at both ends; if the
+  // current profile isn't itself in the carousel (e.g. filtered out, or none open yet) starts from
+  // the first card on ArrowRight or the last on ArrowLeft. No-op if the carousel has no cards.
+  async function navigateCarouselProfile(direction) {
+    if (shouldLog("verbose")) log("→ navigateCarouselProfile", traceArgs(arguments));
+    await ensureCruiserCarouselOpen();
+    const ids = getCruiserCarouselIds();
+    if (!ids.length) {
+      setStatus("No cruisers in carousel");
+      return false;
+    }
+    const currentId = getChatContextProfileId();
+    const currentIdx = currentId ? ids.indexOf(currentId) : -1;
+    const nextIdx = currentIdx === -1 ? (direction > 0 ? 0 : ids.length - 1) : (currentIdx + direction + ids.length) % ids.length;
+    const nextId = ids[nextIdx];
+    const card = document.querySelector(`[data-testid="cruiserCard"][id="${nextId}"]`);
+    if (card) {
+      card.click();
+    } else {
+      window.location.assign(`https://sniffies.com/profile/${nextId}`);
+    }
+    return true;
+  }
+  // keydown handler for single-key nav: g=Global Chat, c=Chats list, n/b=next/prev unread,
+  // ArrowRight/ArrowLeft=next/prev carousel profile, f=send random greeting to the open profile.
+  // Ignored while typing, with modifiers, or on key repeat; g/c/arrows/f only fire off a chat route, n/b only on one. Prevents default when it acts.
   function handleNavigationHotkeys(e) {
     if (shouldLog("verbose")) log("→ handleNavigationHotkeys", traceArgs(arguments));
     if (!e || e.defaultPrevented) return;
     if (e.repeat) return;
     if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-    if (!e.key || e.key.length !== 1) return;
     if (isTypingTarget(e.target)) return;
+    const inChat = isChatRoute();
+    // Carousel browse hotkeys, off a chat route only (same scoping as g/c below) so arrow-key
+    // scrolling and 'f' typed inside an open chat are never hijacked. Checked before the
+    // key.length===1 gate since ArrowRight/ArrowLeft are multi-char key names.
+    if (!inChat && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
+      navigateCarouselProfile(e.key === "ArrowRight" ? 1 : -1);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (!e.key || e.key.length !== 1) return;
     const key = e.key.toLowerCase();
+    if (!inChat && key === "f") {
+      const id = getChatContextProfileId();
+      if (id) {
+        triggerShiftRightIntroForProfile(id);
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      return;
+    }
     // Nav hotkeys: g=Global Chat, c=Chats list, n=next unread, b=prev unread.
     if (key !== "g" && key !== "c" && key !== "n" && key !== "b") return;
-    const inChat = isChatRoute();
     if ((key === "g" || key === "c") && inChat) return;
     if ((key === "n" || key === "b") && !inChat) return;
     let acted = false;
@@ -9375,6 +9517,22 @@ ${JSON.stringify(fileContent)}\r
       return `${h} hour${h === 1 ? "" : "s"}`;
     }
     return `${m} minute${m === 1 ? "" : "s"}`;
+  }
+  // Configured Cmd+middle-click hide duration, in hours. Clamped to 1..168 (see
+  // normalizeLoadedState's tempBlockHours coercion); defaults to 24 when unset/invalid.
+  function tempBlockHoursValue() {
+    const h = Math.round(Number(state.tempBlockHours));
+    if (!Number.isFinite(h) || h <= 0) return 24;
+    return Math.min(Math.max(h, 1), 168);
+  }
+  // The configured Cmd+middle-click hide duration in milliseconds (see handleMiddleMark).
+  function tempBlockDurationMs() {
+    return tempBlockHoursValue() * 60 * 60 * 1e3;
+  }
+  // Short label for the panel input's adjoining text, e.g. "24h", "3 days" once past a week.
+  function formatTempBlockHoursShort() {
+    const h = tempBlockHoursValue();
+    return h % 24 === 0 && h > 24 ? `${h / 24}d` : `${h}h`;
   }
   // Hide a profile last active more than the configured "not online" window ago (default 2h).
   // Gated by state.hideNotOnline2h; spared if they have an unanswered recent reply or no known last-active time.
@@ -11454,6 +11612,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
         <span>Middle-click map marker: hide profile</span>
       </div>
       <div class="row">
+        <span>Cmd + middle-click marker/Global Chat: hide temporarily (see duration setting below)</span>
+      </div>
+      <div class="row">
         <span>Middle-click chat window: send random intro phrase</span>
       </div>
       <div class="row">
@@ -11475,6 +11636,10 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       <div class="row">
         <span>Approaching alert (min)</span>
         <input class="num-input" id="sfApproachMinutes" type="number" min="1" max="1440" step="1">
+      </div>
+      <div class="row">
+        <span>Cmd+middle-click hide duration (hrs)</span>
+        <input class="num-input" id="sfTempBlockHours" type="number" min="1" max="168" step="1">
       </div>
       <div class="row">
         <span>Console logging</span>
@@ -11572,6 +11737,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     const showBookmarksBtn = panel2.querySelector("#sfShowBookmarks");
     const showAppointmentsBtn = panel2.querySelector("#sfShowAppointments");
     const approachMinutesInput = panel2.querySelector("#sfApproachMinutes");
+    const tempBlockHoursInput = panel2.querySelector("#sfTempBlockHours");
     const logVerbositySelect = panel2.querySelector("#sfLogVerbosity");
     const optionsToggleBtn = panel2.querySelector("#sfOptionsToggle");
     const advancedOptions = panel2.querySelector("#sfAdvancedOptions");
@@ -11651,6 +11817,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     if (hlUnspecified) hlUnspecified.checked = !!state.highlightUnspecified;
     if (approachMinutesInput) {
       approachMinutesInput.value = String(getApproachMinutes());
+    }
+    if (tempBlockHoursInput) {
+      tempBlockHoursInput.value = String(tempBlockHoursValue());
     }
     if (logVerbositySelect) {
       const selected = Object.prototype.hasOwnProperty.call(LOG_VERBOSITY_LEVELS, state.logVerbosity) ? state.logVerbosity : "quiet";
@@ -11986,6 +12155,13 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       renderAppointmentPanel();
       setStatus(`Approaching alert: ${minutes} min`);
     });
+    tempBlockHoursInput == null ? void 0 : tempBlockHoursInput.addEventListener("change", () => {
+      const hours = Math.min(168, Math.max(1, parseInt(tempBlockHoursInput.value || "", 10) || 24));
+      state.tempBlockHours = hours;
+      tempBlockHoursInput.value = String(hours);
+      saveState();
+      setStatus(`Cmd+middle-click hide duration: ${formatTempBlockHoursShort()}`);
+    });
     logVerbositySelect == null ? void 0 : logVerbositySelect.addEventListener("change", () => {
       const next = String(logVerbositySelect.value || "quiet").toLowerCase();
       state.logVerbosity = Object.prototype.hasOwnProperty.call(LOG_VERBOSITY_LEVELS, next) ? next : "quiet";
@@ -12163,6 +12339,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     otherMessages: String(state.otherMessages || ""),
     quickPhraseSort: normalizedQuickPhraseSort(state.quickPhraseSort),
     appointmentApproachMinutes: getApproachMinutes(),
+    tempBlockHours: tempBlockHoursValue(),
     notOnlineWindowMinutes: notOnlineWindowMinutesValue(),
     bookmarkSortBy: String(state.bookmarkSortBy || "newest"),
     bookmarkOnlineFilter: String(state.bookmarkOnlineFilter || "all"),
@@ -12317,6 +12494,16 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
         state.appointmentApproachMinutes = nextMinutes;
         changed = true;
         appointmentUiChanged = true;
+      }
+    }
+    if (hasOwn("tempBlockHours")) {
+      // Clamps the Cmd+middle-click hide duration to 1..168 hours (1 hour to 7 days), falling back
+      // to the current value on a non-numeric input.
+      const nextHours = Math.round(Number(next.tempBlockHours));
+      const clampedHours = Number.isFinite(nextHours) && nextHours > 0 ? Math.min(Math.max(nextHours, 1), 168) : tempBlockHoursValue();
+      if (tempBlockHoursValue() !== clampedHours) {
+        state.tempBlockHours = clampedHours;
+        changed = true;
       }
     }
     if (hasOwn("notOnlineWindowMinutes")) {
@@ -12502,6 +12689,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       unknown,
       hiddenMarkers: countHiddenMarkers(),
       blockedCount: blocked.size,
+      tempBlockedCount: tempBlockExpiresAt.size,
       chatTrackedProfiles: chatActivity.size,
       knownSelfIds: selfProfileIds.size,
       appointments: appointments.size,
@@ -12750,5 +12938,5 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.11.4)");
+  logInfo("Sniffies soft filter loaded (v0.12.2)");
 })();

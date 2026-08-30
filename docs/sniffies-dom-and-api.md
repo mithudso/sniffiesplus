@@ -7,7 +7,7 @@ its source and a confidence marker.
 
 | Tag | File | Notes |
 |---|---|---|
-| `US` | `Sniffies Soft Filter (Bottom - Vers Bottom)-0.12.1.txt` (12,545 lines) | Userscript that monkey-patches `fetch`/XHR/`WebSocket` and drives the live DOM. Encodes empirically-derived knowledge. |
+| `US` | `sniffiesplus.js` (~12,942 lines) | Userscript that monkey-patches `fetch`/XHR/`WebSocket` and drives the live DOM. Encodes empirically-derived knowledge. |
 | `SNAP` | `Sniffies App _ Map.html` (943 KB) + `Sniffies App _ Map_files/` | Saved DOM snapshot of the map view, 2026‑06‑14. Angular 21.2.12 + MapLibre GL. |
 
 **Confidence**

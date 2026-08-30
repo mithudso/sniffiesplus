@@ -11,29 +11,11 @@ import path from "node:path";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-// Resolve the userscript regardless of version-bumped filename. Picks the highest -X.Y.Z version,
-// NOT the lexicographically-last filename — a plain string sort would rank "0.11.0" before "0.8.2"
-// (comparing "1" < "8" at the first differing character), silently testing a stale, superseded file.
-import { readdirSync } from "node:fs";
+// The userscript is a single canonical file (git history covers versioning, so the version is no
+// longer carried in the filename). SNIFFIES_SRC_FILE overrides it — e.g. to boot an older exported
+// variant against the same suite.
 const ROOT = path.resolve(HERE, "..");
-function versionOf(name) {
-  const m = name.match(/-(\d+)\.(\d+)\.(\d+)(?:\s+\d+)?\.txt$/);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [-1, -1, -1];
-}
-function compareVersions(a, b) {
-  const va = versionOf(a), vb = versionOf(b);
-  for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return va[i] - vb[i];
-  return 0;
-}
-// SNIFFIES_SRC_FILE overrides the version-sort resolution so the suite can be pointed at any
-// variant (e.g. `SNIFFIES_SRC_FILE=sniffiesplus.txt npm test`) — without it, only files matching
-// the canonical name pattern are candidates and the highest version wins.
-const SRC_OVERRIDE = process.env.SNIFFIES_SRC_FILE || "";
-const SRC_NAME = SRC_OVERRIDE || readdirSync(ROOT)
-  .filter((f) => /^Sniffies Soft Filter .*\.txt$/.test(f))
-  .sort(compareVersions)
-  .pop();
-if (!SRC_NAME) throw new Error("Could not find the Sniffies userscript .txt next to test/");
+const SRC_NAME = process.env.SNIFFIES_SRC_FILE || "sniffiesplus.js";
 export const SRC_PATH = path.join(ROOT, SRC_NAME);
 
 // Module-state handles worth exposing for tests (live references to the in-memory maps/objects).

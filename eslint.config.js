@@ -5,15 +5,13 @@
 import globals from "globals";
 
 export default [
-  // Ignore deps, coverage, .bak snapshots, iCloud/Finder conflict copies ("name 2.txt") — stale
-  // duplicates of the canonical versioned .txt — and the frozen site snapshot's vendor bundles.
-  { ignores: ["node_modules/**", "coverage/**", "**/*.bak", "**/* [0-9].txt", "Sniffies App _ Map_files/**", "dist/**"] },
+  // Ignore deps, coverage, .bak snapshots, iCloud/Finder conflict copies, the generated bundles,
+  // and the frozen site snapshot's vendor bundles.
+  { ignores: ["node_modules/**", "coverage/**", "**/*.bak", "**/* [0-9].js", "Sniffies App _ Map_files/**", "dist/**"] },
 
-  // The userscript: one browser IIFE, shipped as a .txt. Glob covers every root-level .txt so a
-  // renamed variant (e.g. sniffiesplus.txt) still gets no-undef/TDZ linting — the case-sensitive
-  // "Sniffies*.txt" silently skipped it.
+  // The userscript: one browser IIFE, shipped as sniffiesplus.js (script, not module).
   {
-    files: ["*.txt"],
+    files: ["sniffiesplus.js"],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "script",

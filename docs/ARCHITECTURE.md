@@ -1,11 +1,10 @@
 # Architecture
 
-One file, one IIFE, `"use strict"`, no dependencies, no build step. The userscript ships as a
-`.txt` (JavaScript with a `// ==UserScript==` header) and runs in the Tampermonkey sandbox on
-`https://sniffies.com/*`. Two source variants sit in the repo root: the canonical versioned file
-(`Sniffies Soft Filter (Bottom - Vers Bottom)-<version>.txt`) and `sniffiesplus.txt`, a variant of
-the same IIFE. Lines **14–120 of the script itself** are the authoritative in-file README +
-architecture overview — read that block first; this document is the repo-level map around it.
+One file, one IIFE, `"use strict"`, no dependencies, no build step. The userscript ships as
+`sniffiesplus.js` (JavaScript with a `// ==UserScript==` header) and runs in the Tampermonkey
+sandbox on `https://sniffies.com/*`. Lines **14–120 of the script itself** are the authoritative
+in-file README + architecture overview — read that block first; this document is the repo-level
+map around it.
 
 The script's internal structure, top to bottom: tuning constants → storage load/save helpers →
 crypto → decision engine → chat capture → UI panels → boot.
@@ -85,7 +84,7 @@ memory growth in a long-lived tab. The TTL/retention constants at the top of the
 |---|---|
 | **SES / lockdown** — Sniffies ships a hardened frozen-intrinsics startup | No page-context injection, ever. No `<script>` insertion, no reaching into the page's realm. All work stays in the userscript sandbox. |
 | **Rate limiting** — the partials/profile APIs are the only network surface | Self-imposed budget: `MAX_REQUESTS_PER_MIN = 6`, `COOLDOWN_MS = 10 min` on a 429. New network calls must route through the limiter, never around it. |
-| **No build step** | What you paste into Tampermonkey is what you reviewed. The `.txt` is the canonical, hand-edited source. |
+| **No build step** | What you paste into Tampermonkey is what you reviewed. `sniffiesplus.js` is the canonical, hand-edited source. |
 
 ## Storage model
 
