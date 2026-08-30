@@ -5,7 +5,12 @@ const S = getInternals();
 const HOUR = 3_600_000;
 const mkId = (n) => String(n).padStart(24, "0").replace(/[^0-9a-f]/g, "a");
 
+// Mirrors the real site DOM: each message sits alone inside its own
+// <app-global-chat-user-container> wrapper (the actual hide/show target -- see
+// applyGlobalChatHidingToMessages). Note this wrapper is NOT the shared
+// [data-testid="global-chat-message-container"] list viewport that wraps the whole *ngFor list.
 function makeMsg(id, statsText = "") {
+  const wrapper = document.createElement("app-global-chat-user-container");
   const el = document.createElement("div");
   el.setAttribute("data-testid", "globalChat-message");
   el.id = id;
@@ -15,6 +20,7 @@ function makeMsg(id, statsText = "") {
     s.textContent = statsText;
     el.appendChild(s);
   }
+  wrapper.appendChild(el);
   return el;
 }
 
@@ -28,7 +34,7 @@ beforeEach(() => {
     hideBottom: false, hideVersBottom: false, hideSide: false, hideSubmissiveBottom: false, hidePowerBottom: false,
     hideVers: false, hideVersTop: false, hideTop: false, hidePassiveTop: false, hideDomTopBreeder: false, hideUnspecified: false,
   });
-  document.querySelectorAll('[data-testid="globalChat-message"]').forEach((e) => e.remove());
+  document.querySelectorAll('app-global-chat-user-container, [data-testid="globalChat-message"]').forEach((e) => e.remove());
 });
 
 describe("parseGlobalChatAttitude (read position from the message header)", () => {
@@ -80,13 +86,13 @@ describe("applyGlobalChatHiding (DOM sweep)", () => {
     const blockedP = mkId(10), okP = mkId(11);
     S.__state.blocked.add(blockedP);
     const a = makeMsg(blockedP, "vers"), b = makeMsg(okP, "vers");
-    document.body.append(a, b);
+    document.body.append(a.parentElement, b.parentElement);
     S.applyGlobalChatHiding();
-    expect(a.classList.contains("sniffies-gc-hide")).toBe(true);
-    expect(b.classList.contains("sniffies-gc-hide")).toBe(false);
+    expect(a.parentElement.classList.contains("sniffies-gc-hide")).toBe(true);
+    expect(b.parentElement.classList.contains("sniffies-gc-hide")).toBe(false);
     S.__state.blocked.delete(blockedP);
     S.applyGlobalChatHiding();
-    expect(a.classList.contains("sniffies-gc-hide")).toBe(false);
+    expect(a.parentElement.classList.contains("sniffies-gc-hide")).toBe(false);
   });
 });
 
@@ -96,7 +102,7 @@ describe("getGlobalChatMessageIdFromElement (resolve author id for a middle-clic
     const msg = makeMsg(p, "30m, vers");
     const child = document.createElement("span");
     msg.appendChild(child);
-    document.body.append(msg);
+    document.body.append(msg.parentElement);
     expect(S.getGlobalChatMessageIdFromElement(child)).toBe(p);
   });
   it("returns null when the target isn't inside a globalChat-message element", () => {
@@ -118,7 +124,7 @@ describe("handleMiddleMark on the Global Chat route (middle-click blocks the aut
   });
   const isHiddenInGlobalChat = (msg) => {
     S.applyGlobalChatHiding();
-    return msg.classList.contains("sniffies-gc-hide");
+    return msg.parentElement.classList.contains("sniffies-gc-hide");
   };
 
   beforeEach(() => { history.pushState({}, "", "/global-chat"); });
@@ -126,7 +132,7 @@ describe("handleMiddleMark on the Global Chat route (middle-click blocks the aut
   it("blocks the message author instead of falling into the chat-window auto-intro path", () => {
     const p = mkId(21);
     const msg = makeMsg(p, "30m, vers");
-    document.body.append(msg);
+    document.body.append(msg.parentElement);
     S.handleMiddleMark(fakeEvent(msg));
     expect(isHiddenInGlobalChat(msg)).toBe(true);
   });
@@ -135,14 +141,14 @@ describe("handleMiddleMark on the Global Chat route (middle-click blocks the aut
     const msg = makeMsg(p, "30m, vers");
     const child = document.createElement("span");
     msg.appendChild(child);
-    document.body.append(msg);
+    document.body.append(msg.parentElement);
     S.handleMiddleMark(fakeEvent(child));
     expect(isHiddenInGlobalChat(msg)).toBe(true);
   });
   it("is a no-op (not a re-block error) on a second middle-click of an already-blocked author", () => {
     const p = mkId(23);
     const msg = makeMsg(p, "30m, vers");
-    document.body.append(msg);
+    document.body.append(msg.parentElement);
     S.handleMiddleMark(fakeEvent(msg));
     expect(() => S.handleMiddleMark(fakeEvent(msg))).not.toThrow();
     expect(isHiddenInGlobalChat(msg)).toBe(true);

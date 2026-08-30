@@ -13,8 +13,10 @@
 // parallel here primes the cache, so each worker's jsdom import is fast. A cold
 // run degrades to "slow once" instead of failing; a warm run is a few seconds.
 import { readdir, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -32,7 +34,11 @@ const WARMABLE = /\.(c?js|mjs|json|node)$/;
 // ~/.claude/skill-consolidation/regen-index.mjs across the owner's other projects (see CLAUDE.md).
 // On a checkout without it, execFileP below throws ENOENT and this warns instead of failing the suite.
 async function checkIndexFreshness() {
-  const script = fileURLToPath(new URL("../regen-index.mjs", import.meta.url));
+  // Same path the pre-commit hook and `npm run check` use — the old repo-root resolution pointed at
+  // a file that never existed there, so every run spawned a doomed child and printed a
+  // MODULE_NOT_FOUND stack. Silently skip when the shared tooling isn't installed on this machine.
+  const script = join(os.homedir(), ".claude/skill-consolidation/regen-index.mjs");
+  if (!existsSync(script)) return;
   try {
     await execFileP(process.execPath, [script, "--check"]);
   } catch (err) {

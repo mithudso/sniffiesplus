@@ -25,7 +25,11 @@ function compareVersions(a, b) {
   for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return va[i] - vb[i];
   return 0;
 }
-const SRC_NAME = readdirSync(ROOT)
+// SNIFFIES_SRC_FILE overrides the version-sort resolution so the suite can be pointed at any
+// variant (e.g. `SNIFFIES_SRC_FILE=sniffiesplus.txt npm test`) — without it, only files matching
+// the canonical name pattern are candidates and the highest version wins.
+const SRC_OVERRIDE = process.env.SNIFFIES_SRC_FILE || "";
+const SRC_NAME = SRC_OVERRIDE || readdirSync(ROOT)
   .filter((f) => /^Sniffies Soft Filter .*\.txt$/.test(f))
   .sort(compareVersions)
   .pop();
@@ -34,9 +38,10 @@ export const SRC_PATH = path.join(ROOT, SRC_NAME);
 
 // Module-state handles worth exposing for tests (live references to the in-memory maps/objects).
 const STATE_HANDLES = [
-  "state", "chatActivity", "profileLastActive", "blocked", "bookmarks", "notes", "appointments",
+  "state", "chatActivity", "profileLastActive", "blocked", "tempBlockExpiresAt", "bookmarks", "notes", "appointments",
   "attitudeCache", "idToMarker", "manualAttitudes", "howdySentAt", "iconRules", "profileRatings",
   "profileFilterCache", "profileTextCache", "includeMatches", "selfProfileIds",
+  "chatDeletionStats", "includeDismissed",
 ];
 
 // Derive top-level function names directly from the source (2-space indent == direct IIFE child).
@@ -55,10 +60,19 @@ export function buildTestableSource() {
   const fns = topLevelFunctionNames(src);
   const idx = src.lastIndexOf("})();");
   if (idx < 0) throw new Error("Could not locate the IIFE close `})();`");
+  // __state entries are getters, not a value snapshot: several of these bindings (blocked,
+  // tempBlockExpiresAt's sibling blockedAt, etc.) get REASSIGNED by their save*() helper (e.g.
+  // `blocked = new Set(...)` in saveBlockedSet) rather than mutated in place. A plain shorthand
+  // snapshot froze at whatever object existed at inject-time, so after the first reassigning call
+  // in a test file every later `__state.blocked` read silently went stale (see the historical
+  // workaround comment in global-chat.test.mjs). Getters always read the CURRENT closure variable.
   const inject =
     "\n;try{(typeof window!==\"undefined\"?window:globalThis).__SNIFFIES_INTERNALS={" +
     fns.join(",") +
-    ",__state:{" + STATE_HANDLES.join(",") + "}" +
+    // Defensive getters: a STATE_HANDLES name absent from an older source variant (e.g.
+    // tempBlockExpiresAt before v0.12.0) degrades to undefined instead of throwing a
+    // ReferenceError at inject-time and killing the whole boot.
+    ",__state:{" + STATE_HANDLES.map((n) => `get ${n}(){try{return ${n};}catch(e){return undefined;}}`).join(",") + "}" +
     "};}catch(e){(typeof window!==\"undefined\"?window:globalThis).__SNIFFIES_INTERNALS_ERR=String((e&&e.stack)||e);}\n";
   return { code: src.slice(0, idx) + inject + src.slice(idx), functionNames: fns };
 }
