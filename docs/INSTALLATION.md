@@ -2,12 +2,22 @@
 
 ## Requirements
 
-- A Chromium or Firefox browser.
-- A userscript manager — [Tampermonkey](https://www.tampermonkey.net/) is the tested
-  path. Greasemonkey 4+ also works: the `gmGetValueSafe` / `gmSetValueSafe` /
-  `gmDeleteValueSafe` wrappers fall back to the `GM.*` promise API when the legacy
-  `GM_*` globals are missing. The script requests these grants:
-  `GM_openInTab`, `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `unsafeWindow`.
+- A browser + userscript manager pairing from the support matrix in
+  [`browser-compatibility.md`](browser-compatibility.md):
+  - **Chrome / Edge / Opera** (any Chromium): [Tampermonkey](https://www.tampermonkey.net/) —
+    the reference platform.
+  - **Firefox**: Tampermonkey or Violentmonkey; Greasemonkey 4+ also works — the
+    `gmGetValueSafe` / `gmSetValueSafe` / `gmDeleteValueSafe` wrappers and the tab opener fall
+    back to the `GM.*` promise API when the legacy `GM_*` globals are missing.
+  - **Safari (macOS) / iOS / iPadOS**: the **Userscripts** app (App Store), then enable it for
+    `sniffies.com` in Safari's extension settings. Tampermonkey for Safari also works on macOS.
+  - **Android**: Firefox for Android or a Chromium fork with extension support (Kiwi, Edge
+    Android) + Tampermonkey. Stock Chrome for Android cannot run userscripts.
+  - The script requests these grants (both legacy and GM4 spellings): `GM_openInTab`,
+    `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `GM.openInTab`, `GM.getValue`,
+    `GM.setValue`, `GM.deleteValue`, `unsafeWindow`.
+- On phones/tablets, hiding works by **long-press** (600 ms) on a marker or Global Chat
+  message — the touch equivalent of the desktop middle-click.
 - Node 20 (`.nvmrc`) **only if you want to run the tests or build the library** — the
   userscript itself (`sniffiesplus.js`) is dependency-free and ships as-is.
 

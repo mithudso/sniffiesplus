@@ -2,46 +2,215 @@
   "repo": "sniffies-soft-filter",
   "note": "Hand-maintained per-file index for LLM retrieval. codebase-overview.md is the human-readable twin. Update both when adding or removing a top-level file.",
   "files": [
-    { "path": ".editorconfig", "kind": "config", "purpose": "Cross-editor formatting rules." },
-    { "path": ".gitattributes", "kind": "config", "purpose": "Line-ending normalization and binary markers." },
-    { "path": ".gitignore", "kind": "config", "purpose": "Ignore rules (node_modules, dist optional, local Claude/session state, snapshot conflict copies)." },
-    { "path": ".nvmrc", "kind": "config", "purpose": "Pinned Node major (20) for CI and local dev." },
-    { "path": ".githooks/pre-commit", "kind": "config", "purpose": "Local pre-commit gate (lint + tests)." },
-    { "path": ".github/workflows/ci.yml", "kind": "ci", "purpose": "CI: lint, vitest (boots the IIFE), node:test lib suite, and dist bundle-drift check." },
-    { "path": "AGENTS.md", "kind": "doc", "purpose": "No repo-local agents; points at the script's ~38 __sniffies* debug globals and the working rules." },
-    { "path": "GEMINI.md", "kind": "doc", "purpose": "Gemini CLI working rules: read the site reference first, never select on _ngcontent hashes, preserve applyHiding order." },
-    { "path": "CLAUDE.md", "kind": "doc", "purpose": "Authoritative agent/contributor rules: single-IIFE architecture, applyHiding ordering, storage conventions, SES constraints, version-bump-touches-3-places." },
-    { "path": "CONTRIBUTING.md", "kind": "doc", "purpose": "How to contribute: edit the canonical sniffiesplus.js directly, run npm run check, the 3-place version bump." },
-    { "path": "CODE_OF_CONDUCT.md", "kind": "doc", "purpose": "Contributor code of conduct." },
-    { "path": "LICENSE", "kind": "doc", "purpose": "MIT." },
-    { "path": "README.md", "kind": "doc", "purpose": "Project overview, quick start, and links to the docs suite." },
-    { "path": "package.json", "kind": "config", "purpose": "Dev scripts (test / test:lib / lint / build:lib / build:check / check) and devDependencies. The userscript itself is dependency-free." },
-    { "path": "eslint.config.js", "kind": "config", "purpose": "Flat ESLint config: correctness rules over the userscript sniffiesplus.js (no-undef/TDZ/dupe-keys), the lib/ browser modules, and dev tooling." },
-    { "path": "vitest.config.js", "kind": "config", "purpose": "Vitest+jsdom config; excludes test/lib/** (those run under node:test); globalSetup warms the file cache." },
-    { "path": "sniffiesplus.js", "kind": "source", "purpose": "The single canonical userscript (v0.12.2). One IIFE: tuning constants, storage, crypto, the applyHiding decision engine, chat capture (patched fetch/XHR/WebSocket), UI panels, boot, plus the temp-block and cruiser-carousel hotkey features. In-file README/ARCHITECTURE at lines 14-110. The vitest harness boots this file by default." },
-    { "path": "lib/index.js", "kind": "source", "purpose": "Interaction-library entry point: createClient assembling api + observer + dom + compose over a shared rate limiter." },
-    { "path": "lib/api.js", "kind": "source", "purpose": "HTTP client for POST /api/user/partials (base×body-shape probing) and /api/user/full (origin failover); computeLastActiveTs + extractAttitudeFromPartial decoders." },
-    { "path": "lib/observe.js", "kind": "source", "purpose": "Opt-in fetch/XHR/WebSocket taps (SES-safe, restorable); decodeSocketFrame (Socket.IO 42[...]); isSniffiesApiUrl hostname guard." },
-    { "path": "lib/dom.js", "kind": "source", "purpose": "Pure DOM helpers: profile-id extraction/normalization, marker/global-chat/cruiser-carousel selectors and resolvers, route detection, attitude-from-marker." },
-    { "path": "lib/compose.js", "kind": "source", "purpose": "Composer resolution + message send (Sniffies has no send API — write via DOM): findComposer, fill, clickSend, pressEnter, sendInCurrentChat." },
-    { "path": "lib/limiter.js", "kind": "source", "purpose": "Rate limiter mirroring the userscript posture (6/min + cooldown gate opened by reportRejection)." },
-    { "path": "lib/errors.js", "kind": "source", "purpose": "Typed errors: SniffiesError, SniffiesAllBasesError, SniffiesTimeoutError." },
-    { "path": "lib/README.md", "kind": "doc", "purpose": "Library overview: read-via-API/write-via-DOM model, module table, usage, build & test." },
-    { "path": "scripts/build-lib.mjs", "kind": "build", "purpose": "Zero-dependency concat build of lib/*.js into dist/ (ESM + window.Sniffies IIFE); fails on module-order drift, duplicate names, or leaked import/export syntax." },
-    { "path": "dist/sniffies.esm.js", "kind": "generated", "purpose": "Generated ESM bundle — do not edit (edit lib/, run npm run build:lib)." },
-    { "path": "dist/sniffies.global.js", "kind": "generated", "purpose": "Generated window.Sniffies IIFE bundle — do not edit." },
-    { "path": "docs/ARCHITECTURE.md", "kind": "doc", "purpose": "System design: single-IIFE structure, the deterministic applyHiding order, data flow, singleton guard/teardown, SES constraint, storage model, how lib/ relates." },
-    { "path": "docs/DEVELOPMENT.md", "kind": "doc", "purpose": "Setup, commands, the no-build/node --check workflow, manual Tampermonkey verification loop, the 3-place version bump, SNIFFIES_SRC_FILE override." },
-    { "path": "docs/TESTING.md", "kind": "doc", "purpose": "Test strategy: the two suites (vitest+jsdom IIFE-boot harness, node:test lib), coverage philosophy, feature-gated suites, cold-cache globalSetup, CI gate." },
-    { "path": "docs/COMPONENTS.md", "kind": "doc", "purpose": "Navigable map of the userscript's major pieces and the lib/ modules with purpose + key exports." },
-    { "path": "docs/SECURITY.md", "kind": "doc", "purpose": "Threat model: SES/lockdown posture, trust boundaries, API-base allowlist, sandboxOnly discipline, export encryption, OAuth PKCE, cross-tab signal auth." },
-    { "path": "docs/logging.md", "kind": "doc", "purpose": "Logging approach: unconditional logWarn/logError vs verbosity-gated log/logInfo, cached-level fast path, trace redactor, corrupt-storage preservation, no-PII rule." },
-    { "path": "docs/INSTALLATION.md", "kind": "doc", "purpose": "Prerequisites, paste-and-reload install, verification, Drive-sync-off-by-default, dev tooling, lib/dist embedding." },
-    { "path": "docs/external-calls.md", "kind": "doc", "purpose": "Inventory of every external call (Sniffies partials/full, Google Drive, GM_openInTab, the observed WebSocket) with auth, timeout, rate-limit, error-logging, and retry/failover." },
-    { "path": "docs/sniffies-dom-and-api.md", "kind": "doc", "purpose": "The site reverse-engineering reference: hosts, routes, HTTP endpoints, Socket.IO protocol, marker/profile/chat DOM, data-testid inventory, auth model, gotchas, coverage gaps. Every entry OBSERVED/INFERRED-tagged. READ BEFORE changing a selector or endpoint." },
-    { "path": "test/harness.mjs", "kind": "test", "purpose": "Turns the single-IIFE userscript into something testable: reads sniffiesplus.js, injects an internals-export before the IIFE close (in memory, never touching the file), defaults to sniffiesplus.js and can be overridden via SNIFFIES_SRC_FILE." },
-    { "path": "test/setup.mjs", "kind": "test", "purpose": "Per-file vitest setup: installs browser/GM/WebCrypto globals + fake timers, boots the userscript IIFE once via indirect eval." },
-    { "path": "test/global-setup.mjs", "kind": "test", "purpose": "Warms the node_modules file cache before workers boot jsdom (cold-cache mitigation); optional INDEX.md drift check when the shared tooling is present." },
-    { "path": "test/lib/", "kind": "test", "purpose": "node:test suites for the interaction library (dom, api, observe, limiter)." }
+    {
+      "path": ".editorconfig",
+      "kind": "config",
+      "purpose": "Cross-editor formatting rules."
+    },
+    {
+      "path": ".gitattributes",
+      "kind": "config",
+      "purpose": "Line-ending normalization and binary markers."
+    },
+    {
+      "path": ".gitignore",
+      "kind": "config",
+      "purpose": "Ignore rules (node_modules, dist optional, local Claude/session state, snapshot conflict copies)."
+    },
+    {
+      "path": ".nvmrc",
+      "kind": "config",
+      "purpose": "Pinned Node major (20) for CI and local dev."
+    },
+    {
+      "path": ".githooks/pre-commit",
+      "kind": "config",
+      "purpose": "Local pre-commit gate (lint + tests)."
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "kind": "ci",
+      "purpose": "CI: lint, vitest (boots the IIFE), node:test lib suite, and dist bundle-drift check."
+    },
+    {
+      "path": "AGENTS.md",
+      "kind": "doc",
+      "purpose": "No repo-local agents; points at the script's ~38 __sniffies* debug globals and the working rules."
+    },
+    {
+      "path": "GEMINI.md",
+      "kind": "doc",
+      "purpose": "Gemini CLI working rules: read the site reference first, never select on _ngcontent hashes, preserve applyHiding order."
+    },
+    {
+      "path": "CLAUDE.md",
+      "kind": "doc",
+      "purpose": "Authoritative agent/contributor rules: single-IIFE architecture, applyHiding ordering, storage conventions, SES constraints, version-bump-touches-3-places."
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "kind": "doc",
+      "purpose": "How to contribute: edit the canonical sniffiesplus.js directly, run npm run check, the 3-place version bump."
+    },
+    {
+      "path": "CODE_OF_CONDUCT.md",
+      "kind": "doc",
+      "purpose": "Contributor code of conduct."
+    },
+    {
+      "path": "LICENSE",
+      "kind": "doc",
+      "purpose": "MIT."
+    },
+    {
+      "path": "README.md",
+      "kind": "doc",
+      "purpose": "Project overview, quick start, and links to the docs suite."
+    },
+    {
+      "path": "package.json",
+      "kind": "config",
+      "purpose": "Dev scripts (test / test:lib / lint / build:lib / build:check / check) and devDependencies. The userscript itself is dependency-free."
+    },
+    {
+      "path": "eslint.config.js",
+      "kind": "config",
+      "purpose": "Flat ESLint config: correctness rules over the userscript sniffiesplus.js (no-undef/TDZ/dupe-keys), the lib/ browser modules, and dev tooling."
+    },
+    {
+      "path": "vitest.config.js",
+      "kind": "config",
+      "purpose": "Vitest+jsdom config; excludes test/lib/** (those run under node:test); globalSetup warms the file cache."
+    },
+    {
+      "path": "sniffiesplus.js",
+      "kind": "source",
+      "purpose": "The single canonical userscript (v0.12.2). One IIFE: tuning constants, storage, crypto, the applyHiding decision engine, chat capture (patched fetch/XHR/WebSocket), UI panels, boot, plus the temp-block and cruiser-carousel hotkey features. In-file README/ARCHITECTURE at lines 14-110. The vitest harness boots this file by default."
+    },
+    {
+      "path": "lib/index.js",
+      "kind": "source",
+      "purpose": "Interaction-library entry point: createClient assembling api + observer + dom + compose over a shared rate limiter."
+    },
+    {
+      "path": "lib/api.js",
+      "kind": "source",
+      "purpose": "HTTP client for POST /api/user/partials (base×body-shape probing) and /api/user/full (origin failover); computeLastActiveTs + extractAttitudeFromPartial decoders."
+    },
+    {
+      "path": "lib/observe.js",
+      "kind": "source",
+      "purpose": "Opt-in fetch/XHR/WebSocket taps (SES-safe, restorable); decodeSocketFrame (Socket.IO 42[...]); isSniffiesApiUrl hostname guard."
+    },
+    {
+      "path": "lib/dom.js",
+      "kind": "source",
+      "purpose": "Pure DOM helpers: profile-id extraction/normalization, marker/global-chat/cruiser-carousel selectors and resolvers, route detection, attitude-from-marker."
+    },
+    {
+      "path": "lib/compose.js",
+      "kind": "source",
+      "purpose": "Composer resolution + message send (Sniffies has no send API — write via DOM): findComposer, fill, clickSend, pressEnter, sendInCurrentChat."
+    },
+    {
+      "path": "lib/limiter.js",
+      "kind": "source",
+      "purpose": "Rate limiter mirroring the userscript posture (6/min + cooldown gate opened by reportRejection)."
+    },
+    {
+      "path": "lib/errors.js",
+      "kind": "source",
+      "purpose": "Typed errors: SniffiesError, SniffiesAllBasesError, SniffiesTimeoutError."
+    },
+    {
+      "path": "lib/README.md",
+      "kind": "doc",
+      "purpose": "Library overview: read-via-API/write-via-DOM model, module table, usage, build & test."
+    },
+    {
+      "path": "scripts/build-lib.mjs",
+      "kind": "build",
+      "purpose": "Zero-dependency concat build of lib/*.js into dist/ (ESM + window.Sniffies IIFE); fails on module-order drift, duplicate names, or leaked import/export syntax."
+    },
+    {
+      "path": "dist/sniffies.esm.js",
+      "kind": "generated",
+      "purpose": "Generated ESM bundle — do not edit (edit lib/, run npm run build:lib)."
+    },
+    {
+      "path": "dist/sniffies.global.js",
+      "kind": "generated",
+      "purpose": "Generated window.Sniffies IIFE bundle — do not edit."
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "kind": "doc",
+      "purpose": "System design: single-IIFE structure, the deterministic applyHiding order, data flow, singleton guard/teardown, SES constraint, storage model, how lib/ relates."
+    },
+    {
+      "path": "docs/DEVELOPMENT.md",
+      "kind": "doc",
+      "purpose": "Setup, commands, the no-build/node --check workflow, manual Tampermonkey verification loop, the 3-place version bump, SNIFFIES_SRC_FILE override."
+    },
+    {
+      "path": "docs/TESTING.md",
+      "kind": "doc",
+      "purpose": "Test strategy: the two suites (vitest+jsdom IIFE-boot harness, node:test lib), coverage philosophy, feature-gated suites, cold-cache globalSetup, CI gate."
+    },
+    {
+      "path": "docs/COMPONENTS.md",
+      "kind": "doc",
+      "purpose": "Navigable map of the userscript's major pieces and the lib/ modules with purpose + key exports."
+    },
+    {
+      "path": "docs/SECURITY.md",
+      "kind": "doc",
+      "purpose": "Threat model: SES/lockdown posture, trust boundaries, API-base allowlist, sandboxOnly discipline, export encryption, OAuth PKCE, cross-tab signal auth."
+    },
+    {
+      "path": "docs/logging.md",
+      "kind": "doc",
+      "purpose": "Logging approach: unconditional logWarn/logError vs verbosity-gated log/logInfo, cached-level fast path, trace redactor, corrupt-storage preservation, no-PII rule."
+    },
+    {
+      "path": "docs/INSTALLATION.md",
+      "kind": "doc",
+      "purpose": "Prerequisites, paste-and-reload install, verification, Drive-sync-off-by-default, dev tooling, lib/dist embedding."
+    },
+    {
+      "path": "docs/external-calls.md",
+      "kind": "doc",
+      "purpose": "Inventory of every external call (Sniffies partials/full, Google Drive, GM_openInTab, the observed WebSocket) with auth, timeout, rate-limit, error-logging, and retry/failover."
+    },
+    {
+      "path": "docs/browser-compatibility.md",
+      "kind": "doc",
+      "purpose": "Per-browser/manager support matrix (Chrome/Edge/Opera/Firefox/Safari/iOS/Android) with the engine quirks the code handles: Firefox Xray exportFunction/cloneInto, GM4 promise-API fallbacks, Safari clipboard/viewport, and the mobile long-press = middle-click fallback."
+    },
+    {
+      "path": "docs/sniffies-dom-and-api.md",
+      "kind": "doc",
+      "purpose": "The site reverse-engineering reference: hosts, routes, HTTP endpoints, Socket.IO protocol, marker/profile/chat DOM, data-testid inventory, auth model, gotchas, coverage gaps. Every entry OBSERVED/INFERRED-tagged. READ BEFORE changing a selector or endpoint."
+    },
+    {
+      "path": "test/harness.mjs",
+      "kind": "test",
+      "purpose": "Turns the single-IIFE userscript into something testable: reads sniffiesplus.js, injects an internals-export before the IIFE close (in memory, never touching the file), defaults to sniffiesplus.js and can be overridden via SNIFFIES_SRC_FILE."
+    },
+    {
+      "path": "test/setup.mjs",
+      "kind": "test",
+      "purpose": "Per-file vitest setup: installs browser/GM/WebCrypto globals + fake timers, boots the userscript IIFE once via indirect eval."
+    },
+    {
+      "path": "test/global-setup.mjs",
+      "kind": "test",
+      "purpose": "Warms the node_modules file cache before workers boot jsdom (cold-cache mitigation); optional INDEX.md drift check when the shared tooling is present."
+    },
+    {
+      "path": "test/lib/",
+      "kind": "test",
+      "purpose": "node:test suites for the interaction library (dom, api, observe, limiter)."
+    }
   ]
 }
