@@ -15,9 +15,9 @@
     "check": "npm run lint && npm test && npm run test:lib && npm run build:check"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.1.9",
-    "eslint": "^10.5.0",
-    "globals": "^17.6.0",
+    "@vitest/coverage-v8": "^4.1.11",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0",
     "jsdom": "^29.1.1",
     "vitest": "^4.1.9"
   }
