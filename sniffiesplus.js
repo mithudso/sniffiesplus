@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.13.0
-// @last-change  2026-08-30 12:00:00 EDT
+// @version      0.14.0
+// @last-change  2026-08-30 15:00:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
 // @match        https://www.sniffies.com/*
@@ -31,12 +31,16 @@ Quick start:
   3) Enable/disable position filters in "Soft Filter".
   4) Use "Hide Now" to force a full hide pass on currently loaded markers.
 
-Primary controls:
+Primary controls (the Soft Filter panel is grouped into collapsible sections; every
+control carries a hover tooltip, and every feature can be toggled from this one panel):
   - Enabled: master on/off switch.
   - Time flag on markers: show/hide chat-age badge on visible markers.
-  - Hide chatted in last 24h: hide profiles with recent interaction, but
+  - Hide chatted in last Nh: hide profiles with recent interaction inside a
+    CONFIGURABLE window (default 24h, 1-168h, set next to the checkbox), but
     auto-unhide one as soon as they reply (their last message newer than yours).
-  - Hide chatted in last 2h: same as the 24h control with a 2-hour window.
+  - Hide chatted in last 2h: same idea with a fixed short 2-hour window.
+  - Auto-hide after 4+ unanswered messages / Auto-hide repeat message-deleters:
+    the two automatic hide gates (both default-on, both toggleable here).
   - Hide not online in last <window>: hide profiles whose last-online time (from
     the partials feed) is older than the selected window. The window is chosen
     next to the toggle: 10 minutes, 2 hours, or a Custom number of minutes (1 to
@@ -83,10 +87,15 @@ Touch devices (phones/tablets — no middle button, no hover, no hotkeys):
   - Panels go full-width on small screens and can be scrolled; drag handles
     still work by touch.
 
-Panels:
-  - Include Matches: shows include keyword matches.
+Panels (all openable from the Soft Filter panel's "Panels & windows" section):
+  - Include Matches: shows include keyword matches, sorted by distance.
   - Bookmarks: save profiles, alias them, tag/category filter, broadcast message.
+    NOTE: hidden by default (showBookmarkPanel starts off) — open it via the
+    Bookmarks button if you've never seen it.
   - Appointments: reminder list with approaching/at-time alerts.
+  - Quick Phrases: the phrase menu; auto-anchors beside a chat composer, and can
+    be opened manually from the panel.
+  - Notes modal: per-profile notes editor, opened from a profile's notes widget.
 
 Google Drive sync:
   - Disabled by default in public builds.
@@ -320,6 +329,9 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     hideDomTopBreeder: false,
     hideUnspecified: false,
     hideRecentChats24h: false,
+    // Window (hours) for the "hide chatted in last Nh" filter above; default 24, clamped 1..168.
+    // The storage key keeps its historical `24h` name for migration compatibility.
+    recentChatHours: 24,
     hideRecentChats2h: false,
     hideAnyChats: false,
     showOnlyChats: false,
@@ -1269,6 +1281,23 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     .sniffies-profile-reminder.compact-empty .sniffies-profile-reminder-summary {
       font-size: 11px;
       color: rgba(255,255,255,.72);
+    }
+    /* ---- Settings-panel sections ---------------------------------------------------------- */
+    .sniffies-soft-panel details.section {
+      margin: 6px 0;
+      border: 1px solid rgba(255,255,255,.14);
+      border-radius: 8px;
+      padding: 2px 8px 6px;
+    }
+    .sniffies-soft-panel details.section > summary {
+      cursor: pointer;
+      font-weight: 600;
+      padding: 5px 0;
+      user-select: none;
+      list-style-position: inside;
+    }
+    .sniffies-soft-panel details.section > summary:hover {
+      color: #9fd3ff;
     }
     /* ---- Cross-browser / mobile adjustments ---------------------------------------------- */
     /* Drag handles: without touch-action:none the browser claims the gesture for scrolling and
@@ -2588,6 +2617,10 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       // clamped to 1..168 (1 hour to 7 days). Invalid/missing values fall back to 24.
       const tempBlockHrs = Math.round(Number(merged.tempBlockHours));
       merged.tempBlockHours = Number.isFinite(tempBlockHrs) && tempBlockHrs > 0 ? Math.min(Math.max(tempBlockHrs, 1), 168) : 24;
+      // Coerce the configurable recent-chat window to a positive integer of hours, clamped 1..168
+      // (1 hour to 7 days). Invalid/missing values fall back to 24 (the historical fixed window).
+      const recentHrs = Math.round(Number(merged.recentChatHours));
+      merged.recentChatHours = Number.isFinite(recentHrs) && recentHrs > 0 ? Math.min(Math.max(recentHrs, 1), 168) : 24;
       return merged;
     };
     for (const k of STATE_KEYS) {
@@ -9581,7 +9614,7 @@ ${JSON.stringify(fileContent)}\r
     const hiddenReasons = [];
     if (blocked.has(id)) hiddenReasons.push("Blocked");
     else if (shouldHideByProfileTerms(id)) hiddenReasons.push(`Excluded by profile text${((_a = profileFilterCache.get(id)) == null ? void 0 : _a.excludeTerm) ? `: ${profileFilterCache.get(id).excludeTerm}` : ""}`);
-    else if (shouldHideByRecentChats(id)) hiddenReasons.push("Chatted in last 24 hours");
+    else if (shouldHideByRecentChats(id)) hiddenReasons.push(`Chatted in last ${recentChatHoursValue()} hours`);
     else if (shouldHideByRecentChats2h(id)) hiddenReasons.push("Chatted in last 2 hours");
     else if (shouldHideByAnyChats(id)) hiddenReasons.push("Has chat history");
     else if (shouldHideByMissingChatHistory(id)) hiddenReasons.push("Missing chat history");
@@ -9672,7 +9705,7 @@ ${JSON.stringify(fileContent)}\r
     if (shouldLog("verbose")) log("→ shouldHideByRecentChats", traceArgs(arguments));
     if (!state.hideRecentChats24h) return false;
     if (hasUnansweredRecentReply(profileId)) return false;
-    return hasRecentChatInteraction(profileId);
+    return hasRecentChatInteraction(profileId, now(), recentChatWindowMs());
   }
   // Hide a profile chatted within 2h, unless the 2h chat filter is off or they have an unanswered recent reply.
   function shouldHideByRecentChats2h(profileId) {
@@ -9713,6 +9746,18 @@ ${JSON.stringify(fileContent)}\r
     const h = Math.round(Number(state.tempBlockHours));
     if (!Number.isFinite(h) || h <= 0) return 24;
     return Math.min(Math.max(h, 1), 168);
+  }
+  // Configured window (hours) for the "hide chatted in last Nh" filter; default 24, clamped 1..168.
+  function recentChatHoursValue() {
+    const h = Math.round(Number(state.recentChatHours));
+    if (!Number.isFinite(h) || h <= 0) return 24;
+    return Math.min(Math.max(h, 1), 168);
+  }
+  // The configured recent-chat window in milliseconds (drives shouldHideByRecentChats and the
+  // launcher count). The unanswered-reply KEEP-VISIBLE override deliberately stays on the fixed
+  // 24h RECENT_CHAT_HIDE_MS — reply freshness is a different concept from the hide window.
+  function recentChatWindowMs() {
+    return recentChatHoursValue() * 60 * 60 * 1e3;
   }
   // The configured Cmd+middle-click hide duration in milliseconds (see handleMiddleMark).
   function tempBlockDurationMs() {
@@ -9773,9 +9818,10 @@ ${JSON.stringify(fileContent)}\r
   function countRecentChatProfilesOnMap() {
     if (shouldLog("verbose")) log("→ countRecentChatProfilesOnMap", traceArgs(arguments));
     const t = now();
+    const windowMs = recentChatWindowMs();
     let count = 0;
     for (const id of idToMarker.keys()) {
-      if (hasRecentChatInteraction(id, t)) count += 1;
+      if (hasRecentChatInteraction(id, t, windowMs)) count += 1;
     }
     return count;
   }
@@ -11384,8 +11430,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     if (!softPanelRecentFilterEl) return;
     const count = countRecentChatProfilesOnMap();
     const enabled = !!state.hideRecentChats24h;
-    softPanelRecentFilterEl.textContent = enabled ? `24h Chats: On (${count})` : `24h Chats: Off (${count})`;
-    softPanelRecentFilterEl.title = enabled ? "Showing filter: hide profiles chatted with in last 24 hours. Click to disable." : "Click to hide profiles chatted with in last 24 hours.";
+    const h = recentChatHoursValue();
+    softPanelRecentFilterEl.textContent = enabled ? `${h}h Chats: On (${count})` : `${h}h Chats: Off (${count})`;
+    softPanelRecentFilterEl.title = enabled ? `Showing filter: hide profiles chatted with in the last ${h} hours. Click to disable.` : `Click to hide profiles chatted with in the last ${h} hours.`;
     softPanelRecentFilterEl.classList.toggle("recent-chat-filter-active", enabled);
   }
   // Update the top 'Any Chats' launcher button: On/Off label with live count, tooltip, and active class.
@@ -11493,7 +11540,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     updateRecentChatFilterLauncher();
     const count = countRecentChatProfilesOnMap();
     setStatus(
-      state.hideRecentChats24h ? `24h chat filter enabled (${count} profile${count === 1 ? "" : "s"} on map)` : "24h chat filter disabled"
+      state.hideRecentChats24h ? `${recentChatHoursValue()}h chat filter enabled (${count} profile${count === 1 ? "" : "s"} on map)` : `${recentChatHoursValue()}h chat filter disabled`
     );
   }
   // Toggle the hide-any-chat-history filter; also force-clears showOnlyChats when enabling (mutually exclusive).
@@ -11530,6 +11577,9 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     saveState();
     applyHiding();
     updateGlobalChatFilterLauncher();
+    // Mirror onto the settings panel's checkbox when it's mounted, so both UIs agree.
+    const panelCb = softPanelEl && softPanelEl.querySelector && softPanelEl.querySelector("#sfGlobalChatToggle");
+    if (panelCb) panelCb.checked = state.hideGlobalChat !== false;
     setStatus(
       state.hideGlobalChat ? "Global Chat filter enabled (messages from map-hidden authors hidden)" : "Global Chat filter disabled (all Global Chat messages shown)"
     );
@@ -11708,167 +11758,201 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     const panel2 = document.createElement("div");
     panel2.className = "sniffies-soft-panel";
     panel2.innerHTML = `
-      <div class="row">
+      <div class="row" title="Drag this header to move the panel">
         <strong>Soft Filter</strong>
         <span>
-          <button class="btn" id="sfUndoHideTop">Undo Last Hide</button>
-          <button class="btn" id="sfHide">Hide</button>
+          <button class="btn" id="sfUndoHideTop" title="Un-hide the most recently hidden profile">Undo Last Hide</button>
+          <button class="btn" id="sfHide" title="Close this panel (the Show Filter launcher stays)">Hide</button>
         </span>
       </div>
-      <div class="rate-counter" id="sfRateCounter">API budget ${MAX_REQUESTS_PER_MIN}/${MAX_REQUESTS_PER_MIN} req/min</div>
-      <label><input type="checkbox" id="sfEnabled"> Enabled</label>
-      <label class="toggle-row" for="sfChatAges">
-        <span class="label-text">Time flag on markers</span>
-        <span class="toggle">
-          <input type="checkbox" id="sfChatAges">
-          <span class="slider"></span>
-        </span>
-      </label>
-      <label><input type="checkbox" id="sfRecentChats24h"> Hide chatted in last 24h</label>
-      <label><input type="checkbox" id="sfRecentChats2h"> Hide chatted in last 2h</label>
-      <label><input type="checkbox" id="sfHideNotOnline2h"> Hide not online in last
-        <select id="sfNotOnlineWindow" class="select-input" style="min-width:auto;width:auto;padding:2px 4px;flex:0 0 auto;">
-          <option value="10">10 min</option>
-          <option value="120">2 hours</option>
-          <option value="custom">Custom</option>
-        </select>
-        <input type="number" id="sfNotOnlineCustomMin" class="num-input" min="1" max="1440" step="1" style="display:none;width:52px;flex:0 0 auto;"><span id="sfNotOnlineCustomUnit" style="display:none;">min</span></label>
-      <label><input type="checkbox" id="sfHideAnyChats"> Hide chatted ever</label>
-      <label><input type="checkbox" id="sfShowOnlyChats"> Show only chatted profiles</label>
-      <div class="att-grid">
-        <label><input type="checkbox" id="sfSide"> Hide Side</label>
-        <label><input type="checkbox" id="sfSubmissiveBottom"> Hide Submissive Bottom</label>
-        <label><input type="checkbox" id="sfBottom"> Hide Bottom</label>
-        <label><input type="checkbox" id="sfPowerBottom"> Hide Power Bottom</label>
-        <label><input type="checkbox" id="sfVersBottom"> Hide Vers Bottom</label>
-        <label><input type="checkbox" id="sfVers"> Hide Vers</label>
-        <label><input type="checkbox" id="sfVersTop"> Hide Vers Top</label>
-        <label><input type="checkbox" id="sfPassiveTop"> Hide Passive Top</label>
-        <label><input type="checkbox" id="sfTop"> Hide Top</label>
-        <label><input type="checkbox" id="sfDomTopBreeder"> Hide Dom Top (Breeder)</label>
-        <label><input type="checkbox" id="sfUnspecified"> Hide Unspecified</label>
-      </div>
-      <div class="row"><span>Highlight attitudes</span></div>
-      <div class="att-grid">
-        <label><input type="checkbox" id="sfHlSide"> Side</label>
-        <label><input type="checkbox" id="sfHlSubmissiveBottom"> Submissive Bottom</label>
-        <label><input type="checkbox" id="sfHlBottom"> Bottom</label>
-        <label><input type="checkbox" id="sfHlPowerBottom"> Power Bottom</label>
-        <label><input type="checkbox" id="sfHlVersBottom"> Vers Bottom</label>
-        <label><input type="checkbox" id="sfHlVers"> Vers</label>
-        <label><input type="checkbox" id="sfHlVersTop"> Vers Top</label>
-        <label><input type="checkbox" id="sfHlPassiveTop"> Passive Top</label>
-        <label><input type="checkbox" id="sfHlTop"> Top</label>
-        <label><input type="checkbox" id="sfHlDomTopBreeder"> Dom Top (Breeder)</label>
-        <label><input type="checkbox" id="sfHlUnspecified"> Unspecified</label>
-      </div>
-      <label class="toggle-row" for="sfExcludeTermsEnabled">
-        <span class="title-count">Exclude profile text <span class="count" id="sfExcludeCount">0</span></span>
-        <span class="toggle">
-          <input type="checkbox" id="sfExcludeTermsEnabled">
-          <span class="slider"></span>
-        </span>
-      </label>
-      <textarea id="sfExcludeTerms" class="filter-input" placeholder="keyword or phrase, one per line"></textarea>
-      <div class="hint">Any match hides the profile</div>
-      <label class="toggle-row" for="sfIncludeTermsEnabled">
-        <span class="title-count">Include profile text <span class="count" id="sfIncludeCount">0</span></span>
-        <span class="toggle">
-          <input type="checkbox" id="sfIncludeTermsEnabled">
-          <span class="slider"></span>
-        </span>
-      </label>
-      <textarea id="sfIncludeTerms" class="filter-input" placeholder="keyword or phrase, one per line"></textarea>
-      <div class="hint">Any match highlights and appears in include list</div>
+      <div class="rate-counter" id="sfRateCounter" title="Self-imposed API budget: at most ${MAX_REQUESTS_PER_MIN} profile fetches per minute; a server rate-limit opens a 10-minute cooldown">API budget ${MAX_REQUESTS_PER_MIN}/${MAX_REQUESTS_PER_MIN} req/min</div>
+      <label title="Master switch: when off, nothing is hidden or highlighted anywhere (map or Global Chat) and all filters below are inert"><input type="checkbox" id="sfEnabled"> Enabled</label>
       <div class="row">
-        <span>Intro phrases (shift-right-click)</span>
+        <button class="btn" id="sfHideNow" title="Scan the map and apply every active filter right now (also fetches missing profile data, budget permitting)">Hide Now</button>
+        <button class="btn" id="sfUndoHide" title="Un-hide the most recently hidden profile">Undo Last Hide</button>
+        <button class="btn" id="sfClear" title="Clear the entire manually-blocked list (asks for confirmation)">Clear Blocked</button>
       </div>
-      <textarea id="sfIntroMessages" class="phrase-input" placeholder="One intro per line"></textarea>
-      <div class="row"><button class="btn" id="sfSaveIntroMessages">Save Intro Phrases</button></div>
-      <div class="hint">Used for Shift + right-click auto-intros; avoids repeats per profile until all intro phrases are used.</div>
-      <div class="row">
-        <span>Other quick phrases</span>
-      </div>
-      <textarea id="sfOtherMessages" class="phrase-input" placeholder="One phrase per line"></textarea>
-      <div class="row"><button class="btn" id="sfSaveOtherMessages">Save Other Phrases</button></div>
-      <div class="hint">Shown in quick phrase menu, not used by Shift + right-click intro send.</div>
-      <div class="row"><span>Shift-click: block</span></div>
-      <div class="row">
-        <button class="btn" id="sfUndoHide">Undo Last Hide</button>
-        <button class="btn" id="sfClear">Clear</button>
-      </div>
-      <div class="row">
-        <span>Middle-click map marker: hide profile</span>
-      </div>
-      <div class="row">
-        <span>Cmd + middle-click marker/Global Chat: hide temporarily (see duration setting below)</span>
-      </div>
-      <div class="row">
-        <span>Middle-click chat window: send random intro phrase</span>
-      </div>
-      <div class="row">
-        <span>Shift + right-click: send random intro phrase</span>
-      </div>
-      <div class="row">
-        <span>Alt + Shift + right-click: save quick phrase</span>
-      </div>
-      <div class="row">
-        <button class="btn" id="sfHideNow">Hide Now</button>
-        <button class="btn" id="sfShowMatches">Show Matches</button>
-      </div>
-      <div class="row">
-        <button class="btn" id="sfShowBookmarks">Show Bookmarks</button>
-      </div>
-      <div class="row">
-        <button class="btn" id="sfShowAppointments">Show Appointments</button>
-      </div>
-      <div class="row">
-        <span>Approaching alert (min)</span>
-        <input class="num-input" id="sfApproachMinutes" type="number" min="1" max="1440" step="1">
-      </div>
-      <div class="row">
-        <span>Cmd+middle-click hide duration (hrs)</span>
-        <input class="num-input" id="sfTempBlockHours" type="number" min="1" max="168" step="1">
-      </div>
-      <div class="row">
-        <span>Console logging</span>
-        <select class="select-input" id="sfLogVerbosity">
-          <option value="quiet">Quiet</option>
-          <option value="normal">Normal</option>
-          <option value="verbose">Verbose</option>
-        </select>
-      </div>
-      <div class="row">
-        <button class="btn" id="sfOptionsToggle">\u2699 Options</button>
-      </div>
-      <div class="advanced" id="sfAdvancedOptions">
+
+      <details class="section" open>
+        <summary title="Hide profiles based on your chat history with them">Chat-history filters</summary>
+        <label title="Hide profiles you have chatted with inside the window set to the right. A profile with an unanswered reply (they wrote last, within 24h) is never hidden by this."><input type="checkbox" id="sfRecentChats24h"> Hide chatted in last
+          <input type="number" id="sfRecentChatHours" class="num-input" min="1" max="168" step="1" style="width:52px;flex:0 0 auto;" title="Window in hours (1–168) for the filter to the left. Default 24."> h</label>
+        <label title="Hide profiles you have chatted with in the last 2 hours (a shorter, separate window from the one above). Unanswered replies are never hidden."><input type="checkbox" id="sfRecentChats2h"> Hide chatted in last 2h</label>
+        <label title="Hide every profile that has ANY recorded chat history with you, however old"><input type="checkbox" id="sfHideAnyChats"> Hide chatted ever</label>
+        <label title="Inverse mode: hide every profile you have NEVER chatted with (mutually exclusive with 'Hide chatted ever')"><input type="checkbox" id="sfShowOnlyChats"> Show only chatted profiles</label>
+        <label title="Auto-hide a profile after you have sent ${UNANSWERED_OUT_HIDE_THRESHOLD}+ messages with no reply — automatically un-hides the moment they reply"><input type="checkbox" id="sfHideUnansweredOut"> Auto-hide after ${UNANSWERED_OUT_HIDE_THRESHOLD}+ unanswered messages</label>
+        <label title="Auto-hide a profile that has deleted ${REPEATED_DELETE_HIDE_THRESHOLD}+ of their own messages to you"><input type="checkbox" id="sfHideRepeatedDeleters"> Auto-hide repeat message-deleters</label>
+      </details>
+
+      <details class="section" open>
+        <summary title="Hide profiles based on when they were last online (from the site's presence feed)">Presence</summary>
+        <label title="Hide profiles whose last-online time is older than the selected window. Presence data is only retained ~24h, so longer windows can't work. Profiles with an unanswered recent reply stay visible."><input type="checkbox" id="sfHideNotOnline2h"> Hide not online in last
+          <select id="sfNotOnlineWindow" class="select-input" style="min-width:auto;width:auto;padding:2px 4px;flex:0 0 auto;" title="Preset windows, or Custom for any 1–1440 minutes">
+            <option value="10">10 min</option>
+            <option value="120">2 hours</option>
+            <option value="custom">Custom</option>
+          </select>
+          <input type="number" id="sfNotOnlineCustomMin" class="num-input" min="1" max="1440" step="1" style="display:none;width:52px;flex:0 0 auto;" title="Custom window in minutes (1–1440)"><span id="sfNotOnlineCustomUnit" style="display:none;">min</span></label>
+      </details>
+
+      <details class="section" open>
+        <summary title="Hide map markers by their listed attitude/position">Hide attitudes</summary>
+        <div class="att-grid">
+          <label title="Hide profiles listing Side"><input type="checkbox" id="sfSide"> Side</label>
+          <label title="Hide profiles listing Submissive Bottom"><input type="checkbox" id="sfSubmissiveBottom"> Submissive Bottom</label>
+          <label title="Hide profiles listing Bottom"><input type="checkbox" id="sfBottom"> Bottom</label>
+          <label title="Hide profiles listing Power Bottom"><input type="checkbox" id="sfPowerBottom"> Power Bottom</label>
+          <label title="Hide profiles listing Vers Bottom"><input type="checkbox" id="sfVersBottom"> Vers Bottom</label>
+          <label title="Hide profiles listing Vers"><input type="checkbox" id="sfVers"> Vers</label>
+          <label title="Hide profiles listing Vers Top"><input type="checkbox" id="sfVersTop"> Vers Top</label>
+          <label title="Hide profiles listing Passive Top"><input type="checkbox" id="sfPassiveTop"> Passive Top</label>
+          <label title="Hide profiles listing Top"><input type="checkbox" id="sfTop"> Top</label>
+          <label title="Hide profiles listing Dom Top (Breeder)"><input type="checkbox" id="sfDomTopBreeder"> Dom Top (Breeder)</label>
+          <label title="Hide profiles whose attitude is unknown/unlisted"><input type="checkbox" id="sfUnspecified"> Unspecified</label>
+        </div>
+      </details>
+
+      <details class="section">
+        <summary title="Outline (not hide) markers of these attitudes so they stand out">Highlight attitudes</summary>
+        <div class="att-grid">
+          <label title="Highlight Side profiles"><input type="checkbox" id="sfHlSide"> Side</label>
+          <label title="Highlight Submissive Bottom profiles"><input type="checkbox" id="sfHlSubmissiveBottom"> Submissive Bottom</label>
+          <label title="Highlight Bottom profiles"><input type="checkbox" id="sfHlBottom"> Bottom</label>
+          <label title="Highlight Power Bottom profiles"><input type="checkbox" id="sfHlPowerBottom"> Power Bottom</label>
+          <label title="Highlight Vers Bottom profiles"><input type="checkbox" id="sfHlVersBottom"> Vers Bottom</label>
+          <label title="Highlight Vers profiles"><input type="checkbox" id="sfHlVers"> Vers</label>
+          <label title="Highlight Vers Top profiles"><input type="checkbox" id="sfHlVersTop"> Vers Top</label>
+          <label title="Highlight Passive Top profiles"><input type="checkbox" id="sfHlPassiveTop"> Passive Top</label>
+          <label title="Highlight Top profiles"><input type="checkbox" id="sfHlTop"> Top</label>
+          <label title="Highlight Dom Top (Breeder) profiles"><input type="checkbox" id="sfHlDomTopBreeder"> Dom Top (Breeder)</label>
+          <label title="Highlight profiles whose attitude is unknown"><input type="checkbox" id="sfHlUnspecified"> Unspecified</label>
+        </div>
+      </details>
+
+      <details class="section">
+        <summary title="Hide or highlight profiles by keywords in their profile text (fetched from the API, budget permitting)">Profile text filters</summary>
+        <label class="toggle-row" for="sfExcludeTermsEnabled" title="Master switch for the exclude list below">
+          <span class="title-count">Exclude profile text <span class="count" id="sfExcludeCount" title="Profiles currently hidden by an exclude term">0</span></span>
+          <span class="toggle">
+            <input type="checkbox" id="sfExcludeTermsEnabled">
+            <span class="slider"></span>
+          </span>
+        </label>
+        <textarea id="sfExcludeTerms" class="filter-input" placeholder="keyword or phrase, one per line" title="One keyword/phrase per line; any match hides the profile"></textarea>
+        <div class="hint">Any match hides the profile</div>
+        <label class="toggle-row" for="sfIncludeTermsEnabled" title="Master switch for the include list below">
+          <span class="title-count">Include profile text <span class="count" id="sfIncludeCount" title="Profiles currently matched by an include term">0</span></span>
+          <span class="toggle">
+            <input type="checkbox" id="sfIncludeTermsEnabled">
+            <span class="slider"></span>
+          </span>
+        </label>
+        <textarea id="sfIncludeTerms" class="filter-input" placeholder="keyword or phrase, one per line" title="One keyword/phrase per line; any match highlights the profile and lists it in the Matches window"></textarea>
+        <div class="hint">Any match highlights and appears in include list</div>
+      </details>
+
+      <details class="section" open>
+        <summary title="Display toggles and the Global Chat auto-filter">Display &amp; Global Chat</summary>
+        <label class="toggle-row" for="sfChatAges" title="Show a small badge next to each marker with how long ago you last chatted with them">
+          <span class="label-text">Time flag on markers</span>
+          <span class="toggle">
+            <input type="checkbox" id="sfChatAges">
+            <span class="slider"></span>
+          </span>
+        </label>
+        <label class="toggle-row" for="sfGlobalChatToggle" title="Also hide Global Chat messages whose author is hidden by the active filters. Manual middle-click blocks always apply, even when this is off. Same switch as the top-bar Global Chat button.">
+          <span class="label-text">Filter Global Chat</span>
+          <span class="toggle">
+            <input type="checkbox" id="sfGlobalChatToggle">
+            <span class="slider"></span>
+          </span>
+        </label>
+      </details>
+
+      <details class="section">
+        <summary title="Open the other floating windows this script adds">Panels &amp; windows</summary>
         <div class="row">
-          <button class="btn" id="sfExport">Export Blocked</button>
-          <button class="btn" id="sfImport">Import Blocked</button>
+          <button class="btn" id="sfShowMatches" title="Window listing every profile matched by an include term, sorted by distance">Matches</button>
+          <button class="btn" id="sfShowBookmarks" title="Window with your saved bookmarks: aliases, categories/tags, last-seen, notes, star ratings, and broadcast">Bookmarks</button>
         </div>
         <div class="row">
-          <button class="btn" id="sfExportData">Export All</button>
-          <button class="btn" id="sfImportData">Import All</button>
+          <button class="btn" id="sfShowAppointments" title="Window with your reminders; alerts fire at the set lead time">Appointments</button>
+          <button class="btn" id="sfShowChatPhrases" title="Quick-phrases window (also opens automatically beside a chat composer)">Quick Phrases</button>
+        </div>
+      </details>
+
+      <details class="section">
+        <summary title="The phrase lists used by auto-intros and the quick-phrase menu">Phrases</summary>
+        <div class="row"><span title="Sent by Shift+right-click / middle-click-in-chat; no repeats per profile until all have been used">Intro phrases (shift-right-click)</span></div>
+        <textarea id="sfIntroMessages" class="phrase-input" placeholder="One intro per line" title="One intro per line; picked at random, avoiding repeats per profile until all have been used"></textarea>
+        <div class="row"><button class="btn" id="sfSaveIntroMessages" title="Save the intro list above">Save Intro Phrases</button></div>
+        <div class="row"><span title="Extra phrases for the quick-phrase menu; never auto-sent">Other quick phrases</span></div>
+        <textarea id="sfOtherMessages" class="phrase-input" placeholder="One phrase per line" title="One phrase per line; shown in the quick-phrase menu, never auto-sent"></textarea>
+        <div class="row"><button class="btn" id="sfSaveOtherMessages" title="Save the list above">Save Other Phrases</button></div>
+      </details>
+
+      <details class="section">
+        <summary title="Durations used by reminders and temporary hides">Timings</summary>
+        <div class="row" title="How many minutes before an appointment the approaching alert fires">
+          <span>Approaching alert (min)</span>
+          <input class="num-input" id="sfApproachMinutes" type="number" min="1" max="1440" step="1" title="1–1440 minutes">
+        </div>
+        <div class="row" title="How long a Cmd+middle-click (Ctrl on Windows/Linux) or long-press temporary hide lasts before the profile reappears">
+          <span>Temp-hide duration (hrs)</span>
+          <input class="num-input" id="sfTempBlockHours" type="number" min="1" max="168" step="1" title="1–168 hours (up to 7 days)">
+        </div>
+      </details>
+
+      <details class="section">
+        <summary title="Backups, Google Drive sync, and console logging">Data, sync &amp; logging</summary>
+        <div class="row">
+          <button class="btn" id="sfExport" title="Copy the blocked-profile list to the clipboard as JSON">Export Blocked</button>
+          <button class="btn" id="sfImport" title="Paste a blocked list (JSON or comma/space-separated ids); MERGES into the current list">Import Blocked</button>
         </div>
         <div class="row">
-          <button class="btn" id="sfEnterToken">Enter Drive Token</button>
-          <button class="btn" id="sfGDriveSync">Sync GDrive</button>
+          <button class="btn" id="sfExportData" title="Export everything (settings, blocks, bookmarks, notes, appointments, phrases) — optionally passphrase-encrypted (AES-GCM)">Export All</button>
+          <button class="btn" id="sfImportData" title="Import a full export; sections MERGE into local data">Import All</button>
         </div>
         <div class="row">
-          <button class="btn" id="sfGDriveLoad">Load GDrive</button>
-          <button class="btn" id="sfGDriveDisconnect">Disconnect</button>
+          <button class="btn" id="sfEnterToken" title="Paste a Google OAuth redirect URL or token (Drive sync is off unless a GOOGLE_CLIENT_ID is configured in the script)">Enter Drive Token</button>
+          <button class="btn" id="sfGDriveSync" title="Push notes/bookmarks/blocks/ratings to the Drive file now">Sync GDrive</button>
         </div>
-      </div>
+        <div class="row">
+          <button class="btn" id="sfGDriveLoad" title="Load the Drive file and OVERWRITE local notes/ratings/blocks/bookmarks (then reloads the page)">Load GDrive</button>
+          <button class="btn" id="sfGDriveDisconnect" title="Forget the Drive token and file id (local data is kept)">Disconnect</button>
+        </div>
+        <div class="row" title="Console verbosity: Quiet = errors/warnings only; Normal adds info; Verbose adds full call traces (noisy)">
+          <span>Console logging</span>
+          <select class="select-input" id="sfLogVerbosity">
+            <option value="quiet">Quiet</option>
+            <option value="normal">Normal</option>
+            <option value="verbose">Verbose</option>
+          </select>
+        </div>
+      </details>
+
+      <details class="section">
+        <summary title="Reference: every mouse/touch gesture the script adds">Gestures</summary>
+        <div class="hint">Shift + left-click marker: block/unblock</div>
+        <div class="hint">Middle-click marker or Global Chat message: hide permanently</div>
+        <div class="hint">Cmd (Ctrl on Win/Linux) + middle-click: hide temporarily (see Timings)</div>
+        <div class="hint">Long-press (touch): same as middle-click</div>
+        <div class="hint">Middle-click chat window: send random intro</div>
+        <div class="hint">Shift + right-click marker/chat: send random intro</div>
+        <div class="hint">Alt + Shift + right-click in chat: save selection as phrase</div>
+        <div class="hint">Keys: g Global Chat · c Chats · n/b next/prev unread · ←/→ carousel · f greet</div>
+      </details>
+
       <div class="row support-links">
         <strong>Support this script</strong>
         <div class="links">
           <a href="https://cash.app/$mitchphudson" target="_blank" rel="noopener noreferrer">Cash App</a>
           <a href="https://account.venmo.com/u/Mitchphudson" target="_blank" rel="noopener noreferrer">Venmo</a>
         </div>
-        <div class="alt">Chime: $Mitchell-Hudson-1 \xB7 Zelle: mitchphudson@gmail.com</div>
+        <div class="alt">Chime: $Mitchell-Hudson-1 · Zelle: mitchphudson@gmail.com</div>
       </div>
-      <div class="sniffies-sync-status">\u25EF Not connected</div>
-      <div class="status" id="sfStatus">Status: ready</div>
+      <div class="sniffies-sync-status" title="Google Drive sync status">◯ Not connected</div>
+      <div class="status" id="sfStatus" title="Last action's result">Status: ready</div>
     `;
     document.body.appendChild(panel2);
     applySoftPanelPos(panel2);
@@ -11892,7 +11976,12 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     const enabled = panel2.querySelector("#sfEnabled");
     const chatAges = panel2.querySelector("#sfChatAges");
     const recentChats24h = panel2.querySelector("#sfRecentChats24h");
+    const recentChatHoursInput = panel2.querySelector("#sfRecentChatHours");
     const recentChats2h = panel2.querySelector("#sfRecentChats2h");
+    const hideUnansweredOutCb = panel2.querySelector("#sfHideUnansweredOut");
+    const hideRepeatedDeletersCb = panel2.querySelector("#sfHideRepeatedDeleters");
+    const globalChatToggleCb = panel2.querySelector("#sfGlobalChatToggle");
+    const showChatPhrasesBtn = panel2.querySelector("#sfShowChatPhrases");
     const hideNotOnline2h = panel2.querySelector("#sfHideNotOnline2h");
     const notOnlineWindow = panel2.querySelector("#sfNotOnlineWindow");
     const notOnlineCustomMin = panel2.querySelector("#sfNotOnlineCustomMin");
@@ -11935,8 +12024,6 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     const approachMinutesInput = panel2.querySelector("#sfApproachMinutes");
     const tempBlockHoursInput = panel2.querySelector("#sfTempBlockHours");
     const logVerbositySelect = panel2.querySelector("#sfLogVerbosity");
-    const optionsToggleBtn = panel2.querySelector("#sfOptionsToggle");
-    const advancedOptions = panel2.querySelector("#sfAdvancedOptions");
     const excludeTerms = panel2.querySelector("#sfExcludeTerms");
     const includeTerms = panel2.querySelector("#sfIncludeTerms");
     const excludeTermsEnabled = panel2.querySelector("#sfExcludeTermsEnabled");
@@ -11971,7 +12058,12 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     // '!== false' default-on idiom: an undefined/missing flag is treated as enabled.
     chatAges.checked = state.showChatAges !== false;
     if (recentChats24h) recentChats24h.checked = !!state.hideRecentChats24h;
+    if (recentChatHoursInput) recentChatHoursInput.value = String(recentChatHoursValue());
     if (recentChats2h) recentChats2h.checked = !!state.hideRecentChats2h;
+    // '!== false' default-on idiom for the two auto-hide gates and the Global Chat filter.
+    if (hideUnansweredOutCb) hideUnansweredOutCb.checked = state.hideUnansweredOut !== false;
+    if (hideRepeatedDeletersCb) hideRepeatedDeletersCb.checked = state.hideRepeatedDeleters !== false;
+    if (globalChatToggleCb) globalChatToggleCb.checked = state.hideGlobalChat !== false;
     if (hideNotOnline2h) hideNotOnline2h.checked = !!state.hideNotOnline2h;
     // Sync the window selector UI from state: a stored 10 or 120 shows the matching preset; anything else is
     // treated as "Custom" with the minutes box revealed and populated.
@@ -12061,10 +12153,39 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       applyHiding();
       updateRecentChatFilterLauncher();
     });
+    recentChatHoursInput == null ? void 0 : recentChatHoursInput.addEventListener("change", () => {
+      const hours = Math.min(168, Math.max(1, parseInt(recentChatHoursInput.value || "", 10) || 24));
+      recentChatHoursInput.value = String(hours);
+      state.recentChatHours = hours;
+      saveState();
+      applyHiding();
+      updateRecentChatFilterLauncher();
+      setStatus(`Recent-chat window set to ${hours}h`);
+    });
     recentChats2h == null ? void 0 : recentChats2h.addEventListener("change", () => {
       state.hideRecentChats2h = !!recentChats2h.checked;
       saveState();
       applyHiding();
+    });
+    hideUnansweredOutCb == null ? void 0 : hideUnansweredOutCb.addEventListener("change", () => {
+      state.hideUnansweredOut = !!hideUnansweredOutCb.checked;
+      saveState();
+      applyHiding();
+    });
+    hideRepeatedDeletersCb == null ? void 0 : hideRepeatedDeletersCb.addEventListener("change", () => {
+      state.hideRepeatedDeleters = !!hideRepeatedDeletersCb.checked;
+      saveState();
+      applyHiding();
+    });
+    globalChatToggleCb == null ? void 0 : globalChatToggleCb.addEventListener("change", () => {
+      state.hideGlobalChat = !!globalChatToggleCb.checked;
+      saveState();
+      applyHiding();
+      updateGlobalChatFilterLauncher();
+    });
+    showChatPhrasesBtn == null ? void 0 : showChatPhrasesBtn.addEventListener("click", () => {
+      setChatPhrasePanelVisible(true);
+      setStatus("Quick Phrases panel shown");
     });
     hideNotOnline2h == null ? void 0 : hideNotOnline2h.addEventListener("change", () => {
       state.hideNotOnline2h = !!hideNotOnline2h.checked;
@@ -12365,12 +12486,6 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       setStatus(`Logging: ${state.logVerbosity}`);
       logInfo(`Logging verbosity set to ${state.logVerbosity}`);
     });
-    optionsToggleBtn == null ? void 0 : optionsToggleBtn.addEventListener("click", () => {
-      if (!advancedOptions) return;
-      const visible = advancedOptions.style.display === "block";
-      advancedOptions.style.display = visible ? "none" : "block";
-      optionsToggleBtn.textContent = visible ? "\u2699 Options" : "\u2699 Hide Options";
-    });
     hide.addEventListener("click", () => setSoftPanelVisible(false));
     exp.addEventListener("click", exportBlocked);
     imp.addEventListener("click", importBlocked);
@@ -12534,6 +12649,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
     introMessages: String(state.introMessages || ""),
     otherMessages: String(state.otherMessages || ""),
     quickPhraseSort: normalizedQuickPhraseSort(state.quickPhraseSort),
+    recentChatHours: recentChatHoursValue(),
     appointmentApproachMinutes: getApproachMinutes(),
     tempBlockHours: tempBlockHoursValue(),
     notOnlineWindowMinutes: notOnlineWindowMinutesValue(),
@@ -12700,6 +12816,16 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
       if (tempBlockHoursValue() !== clampedHours) {
         state.tempBlockHours = clampedHours;
         changed = true;
+      }
+    }
+    if (hasOwn("recentChatHours")) {
+      // Clamps the recent-chat hide window to 1..168 hours, same contract as tempBlockHours.
+      const nextRecent = Math.round(Number(next.recentChatHours));
+      const clampedRecent = Number.isFinite(nextRecent) && nextRecent > 0 ? Math.min(Math.max(nextRecent, 1), 168) : recentChatHoursValue();
+      if (recentChatHoursValue() !== clampedRecent) {
+        state.recentChatHours = clampedRecent;
+        changed = true;
+        chatUiChanged = true;
       }
     }
     if (hasOwn("notOnlineWindowMinutes")) {
@@ -13134,5 +13260,5 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.13.0)");
+  logInfo("Sniffies soft filter loaded (v0.14.0)");
 })();

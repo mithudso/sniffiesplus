@@ -95,3 +95,48 @@ describe("shouldHideByUnansweredOut", () => {
     expect(S.shouldHideByUnansweredOut(p)).toBe(false);
   });
 });
+
+describe("recentChatHours (configurable hide-window for shouldHideByRecentChats)", () => {
+  beforeEach(() => {
+    S.__state.chatActivity.clear();
+    S.__state.state.hideRecentChats24h = true;
+    S.__state.state.recentChatHours = 24;
+  });
+
+  it("honors the configured window: 6h window ignores a 12h-old chat, catches a 3h-old one", () => {
+    const oldChat = mkId(20);
+    const newChat = mkId(21);
+    const t12h = S.now() - 12 * 60 * 60 * 1000;
+    const t3h = S.now() - 3 * 60 * 60 * 1000;
+    S.__state.chatActivity.set(oldChat, { myLastTs: t12h, theirLastTs: 0, anyLastTs: t12h, updatedAt: t12h });
+    S.__state.chatActivity.set(newChat, { myLastTs: t3h, theirLastTs: 0, anyLastTs: t3h, updatedAt: t3h });
+    // Default 24h window hides both.
+    expect(S.shouldHideByRecentChats(oldChat)).toBe(true);
+    expect(S.shouldHideByRecentChats(newChat)).toBe(true);
+    // A 6h window releases the 12h-old chat, keeps the 3h-old one hidden.
+    S.__state.state.recentChatHours = 6;
+    expect(S.shouldHideByRecentChats(oldChat)).toBe(false);
+    expect(S.shouldHideByRecentChats(newChat)).toBe(true);
+  });
+
+  it("recentChatHoursValue clamps to 1..168 and defaults to 24 on junk", () => {
+    S.__state.state.recentChatHours = 0;
+    expect(S.recentChatHoursValue()).toBe(24);
+    S.__state.state.recentChatHours = 9999;
+    expect(S.recentChatHoursValue()).toBe(168);
+    S.__state.state.recentChatHours = "not a number";
+    expect(S.recentChatHoursValue()).toBe(24);
+    S.__state.state.recentChatHours = 48;
+    expect(S.recentChatHoursValue()).toBe(48);
+    expect(S.recentChatWindowMs()).toBe(48 * 60 * 60 * 1000);
+  });
+
+  it("the unanswered-reply keep-visible override still applies inside any window", () => {
+    const p = mkId(22);
+    const t1h = S.now() - 60 * 60 * 1000;
+    // They wrote last (unanswered reply): stays visible even with a wide window.
+    S.__state.chatActivity.set(p, { myLastTs: t1h - 5000, theirLastTs: t1h, anyLastTs: t1h, updatedAt: t1h });
+    S.__state.state.recentChatHours = 168;
+    expect(S.shouldHideByRecentChats(p)).toBe(false);
+  });
+});
