@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.14.0
-// @last-change  2026-08-30 15:00:00 EDT
+// @version      0.14.1
+// @last-change  2026-08-30 23:30:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
 // @match        https://www.sniffies.com/*
@@ -1773,6 +1773,8 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   let profileContainerObserver = null;
   let globalChatHideObserver = null;
   let profileContainerCheckTimer = 0;
+  // One-shot overlay re-check timers for the current profile widgets (see scheduleProfileWidgetOverlayChecks).
+  let profileWidgetOverlayTimers = [];
   let profileRefreshTimer = 0;
   let bookmarkSaveTimer = 0;
   let broadcastTimer = 0;
@@ -3754,11 +3756,36 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
       return false;
     }
+    // The badge is position:fixed at z-index 100010, so it would paint over anything the host draws
+    // above the marker: the open profile pane, the map loading overlay, dialogs, our own panels.
+    // Hit-test the anchor's centre and hide the badge when the topmost element there is not part
+    // of the marker layer (one hit-test per ON-SCREEN marker per sweep; off-screen ones bailed above).
+    if (!isMarkerSurfaceVisibleAt(rect, root)) return false;
     const top = rect.top + rect.height / 2;
     const left = side === "left" ? rect.left - 6 : rect.right + 6;
     badge.style.top = `${Math.round(top)}px`;
     badge.style.left = `${Math.round(left)}px`;
     return true;
+  }
+  // True when the topmost element at the centre of a marker anchor rect is the marker itself, another
+  // marker, or the map surface — i.e. nothing (profile pane, loading overlay, dialog, our panels) covers it.
+  // A point outside the viewport hit-tests to null and counts as covered.
+  function isMarkerSurfaceVisibleAt(rect, root) {
+    if (shouldLog("verbose")) log("→ isMarkerSurfaceVisibleAt", traceArgs(arguments));
+    if (!rect) return false;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) return false;
+    let hit = null;
+    try {
+      hit = document.elementFromPoint(cx, cy);
+    } catch (e) {
+      return true;
+    }
+    if (!hit) return false;
+    if (root && typeof root.contains === "function" && root.contains(hit)) return true;
+    if (typeof hit.closest !== "function") return true;
+    return !!hit.closest(".maplibregl-marker, .mgl-marker, .maplibregl-canvas-container, .maplibregl-map");
   }
   // Compute and position the single left-side chat-age badge for one marker from chatActivity (or a howdy/preview fallback).
   // Hides everything when root missing/hidden or showChatAges off; prefers their-last, then my-last, then any-last; always removes any legacy right-side badge.
@@ -6812,6 +6839,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     try { if (pendingRefreshTimer) { clearTimeout(pendingRefreshTimer); pendingRefreshTimer = 0; } } catch (e) {}
     try { if (chatBadgeRefreshTimer) { clearTimeout(chatBadgeRefreshTimer); chatBadgeRefreshTimer = 0; } } catch (e) {}
     try { if (profileRefreshTimer) { clearTimeout(profileRefreshTimer); profileRefreshTimer = 0; } } catch (e) {}
+    try { clearProfileWidgetOverlayChecks(); } catch (e) {}
     try { if (chatSaveTimer) { clearTimeout(chatSaveTimer); chatSaveTimer = 0; } } catch (e) {}
     try { if (chatDeletionSaveTimer) { clearTimeout(chatDeletionSaveTimer); chatDeletionSaveTimer = 0; } } catch (e) {}
     try { if (bookmarkSaveTimer) { clearTimeout(bookmarkSaveTimer); bookmarkSaveTimer = 0; } } catch (e) {}
@@ -9283,17 +9311,27 @@ ${JSON.stringify(fileContent)}\r
   }
   // Multi-strategy heuristic to locate the visible open-profile container: .his-profile content/child, then #sniffies-infowindow, then visible dialog/modal/panel elements containing profile-info text.
   // Falls back all the way to document.body when nothing matches.
+  // True when a DOMRect has area and intersects the viewport (used to reject animated-off-screen pane wrappers).
+  function isRectOnScreen(rect) {
+    if (shouldLog("verbose")) log("→ isRectOnScreen", traceArgs(arguments));
+    if (!rect) return false;
+    return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;
+  }
   function findProfileContainer() {
     if (shouldLog("verbose")) log("→ findProfileContainer", traceArgs(arguments));
     const hisProfile = document.querySelector(".his-profile");
     if (hisProfile) {
       const computed = window.getComputedStyle(hisProfile);
       if (computed.visibility !== "hidden" && computed.display !== "none") {
+        // OBSERVED: `.his-profile > div.position-relative` is a position:fixed wrapper that the slide
+        // animation parks at left = viewport width; `#app-screen` (the visible pane) is absolutely
+        // positioned inside it. Every candidate below must be on-screen, otherwise widgets get
+        // injected into the parked wrapper and never show. Returning null just defers to the next poll.
         const contentDivs = hisProfile.querySelectorAll('div[style*="overflow"], [class*="content"], [class*="scroll"]');
         for (const div of contentDivs) {
           const rect = div.getBoundingClientRect();
           const divComputed = window.getComputedStyle(div);
-          if (rect.height > 100 && div.querySelectorAll("*").length > 3 && divComputed.visibility !== "hidden" && divComputed.display !== "none") {
+          if (rect.height > 100 && isRectOnScreen(rect) && div.querySelectorAll("*").length > 3 && divComputed.visibility !== "hidden" && divComputed.display !== "none") {
             return div;
           }
         }
@@ -9301,11 +9339,11 @@ ${JSON.stringify(fileContent)}\r
         for (const child of children) {
           const rect = child.getBoundingClientRect();
           const childComputed = window.getComputedStyle(child);
-          if (rect.height > 100 && childComputed.visibility !== "hidden" && childComputed.display !== "none") {
+          if (rect.height > 100 && isRectOnScreen(rect) && childComputed.visibility !== "hidden" && childComputed.display !== "none") {
             return child;
           }
         }
-        return hisProfile;
+        return isRectOnScreen(hisProfile.getBoundingClientRect()) && hisProfile.getBoundingClientRect().height > 100 ? hisProfile : null;
       }
     }
     const infoWindow = document.querySelector('[id="sniffies-infowindow"]');
@@ -10314,6 +10352,91 @@ ${JSON.stringify(fileContent)}\r
       }
     }
   }
+  // Sniffies paints absolutely-positioned banners over the top of the profile scroll area — e.g. the
+  // NSFW-consent bar ("They Can't See Your Full Profile" + Reveal). Our widgets are prepended into that
+  // same area, so the banner covers them. Markup-agnostic fix: hit-test the notes widget at its NATURAL
+  // (un-offset) position; if the topmost element there belongs to the host page, push both widgets
+  // (notes carries the margin; reminder follows in flow) below that overlay's bottom edge. The natural
+  // position is MEASURED (margin cleared, rect read, margin re-applied in the same task — no paint in
+  // between) rather than derived from the stored offset, so a pass can never accumulate and the offset
+  // drops back to 0 when the banner goes away. Costs one forced reflow per pass (5s poll + 4 one-shots).
+  // Returns the applied offset in px.
+  const PROFILE_WIDGET_OVERLAY_GAP_PX = 6;
+  const PROFILE_WIDGET_OVERLAY_MAX_PX = 200;
+  function adjustProfileWidgetsForOverlay(container) {
+    if (shouldLog("verbose")) log("→ adjustProfileWidgetsForOverlay", traceArgs(arguments));
+    if (!container || typeof container.querySelector !== "function") return 0;
+    const notes = container.querySelector(".sniffies-profile-notes");
+    if (!notes || !document.body.contains(notes)) return 0;
+    const reminder = container.querySelector(".sniffies-profile-reminder");
+    const current = parseFloat(notes.dataset.overlayOffset || "0") || 0;
+    const restore = () => {
+      notes.style.marginTop = current ? `${current}px` : "";
+    };
+    notes.style.marginTop = "";
+    const rect = notes.getBoundingClientRect();
+    if (rect.width < 20 || rect.height < 4) {
+      restore();
+      return current;
+    }
+    const naturalTop = rect.top;
+    const y = naturalTop + rect.height / 2;
+    if (y < 0 || y >= window.innerHeight || rect.right <= 0 || rect.left >= window.innerWidth) {
+      restore();
+      return current;
+    }
+    const isOurs = (el) => notes.contains(el) || (reminder && reminder.contains(el)) || (typeof el.closest === "function" && !!el.closest(".sniffies-profile-notes, .sniffies-profile-reminder"));
+    let overlayBottom = -Infinity;
+    for (const frac of [0.2, 0.5, 0.85]) {
+      const x = rect.left + rect.width * frac;
+      if (x < 0 || x >= window.innerWidth) continue;
+      let hit = null;
+      try {
+        hit = document.elementFromPoint(x, y);
+      } catch (e) {
+        hit = null;
+      }
+      // Empty space inside a transparent container hit-tests to the container (or an ancestor): not an overlay.
+      if (!hit || hit === container || hit.contains(container) || isOurs(hit)) continue;
+      // Climb to the overlay's outermost box, stopping at the container / an ancestor of it, at the
+      // notes widget's own subtree, or when the parent is too tall to plausibly be a banner.
+      let block = hit;
+      while (block.parentElement) {
+        const parent = block.parentElement;
+        if (parent === container || parent.contains(container) || parent === document.body) break;
+        if (parent.getBoundingClientRect().height > PROFILE_WIDGET_OVERLAY_MAX_PX) break;
+        block = parent;
+      }
+      overlayBottom = Math.max(overlayBottom, block.getBoundingClientRect().bottom);
+    }
+    let next = 0;
+    if (Number.isFinite(overlayBottom)) {
+      next = Math.max(0, Math.min(PROFILE_WIDGET_OVERLAY_MAX_PX, Math.round(overlayBottom + PROFILE_WIDGET_OVERLAY_GAP_PX - naturalTop)));
+    }
+    notes.style.marginTop = next ? `${next}px` : "";
+    notes.dataset.overlayOffset = String(next);
+    return next;
+  }
+  // The consent banner mounts asynchronously after the pane; re-check a few times after injection.
+  // Previous one-shots are cancelled first (a re-render replaces the widgets), and teardownSniffies()
+  // clears whatever is still pending.
+  function scheduleProfileWidgetOverlayChecks(container) {
+    if (shouldLog("verbose")) log("→ scheduleProfileWidgetOverlayChecks", traceArgs(arguments));
+    clearProfileWidgetOverlayChecks();
+    if (!container) return;
+    for (const delay of [0, 250, 900, 2200]) {
+      profileWidgetOverlayTimers.push(setTimeout(() => {
+        if (!document.body.contains(container)) return;
+        adjustProfileWidgetsForOverlay(container);
+      }, delay));
+    }
+  }
+  function clearProfileWidgetOverlayChecks() {
+    if (shouldLog("verbose")) log("→ clearProfileWidgetOverlayChecks", traceArgs(arguments));
+    for (const t of profileWidgetOverlayTimers.splice(0)) {
+      try { clearTimeout(t); } catch (e) {}
+    }
+  }
   // Rebuild the injected notes panel for a profile: note text, 5-star rating, bookmark/hide buttons, edit pencil.
   // Removes stale panels first, then injects notes + reminder widgets and starts the container observer.
   function updateProfileNotesDisplay(profileId) {
@@ -10413,6 +10536,7 @@ ${JSON.stringify(fileContent)}\r
     injectProfileWidget(container, notesDisplay);
     injectProfileWidget(container, reminderDisplay, notesDisplay);
     observeContainerForChanges(normalizedProfileId, container);
+    scheduleProfileWidgetOverlayChecks(container);
   }
   // Watch a profile container and re-inject widgets if the notes/reminder nodes get removed.
   // Uses a single-child MutationObserver plus a 1500ms interval; resets any prior observer/timer.
@@ -10435,7 +10559,10 @@ ${JSON.stringify(fileContent)}\r
       const reminderStillThere = container.querySelector(".sniffies-profile-reminder");
       if (!notesStillThere || !reminderStillThere) {
         scheduleProfileDisplayRefresh(profileId, 120);
+        return;
       }
+      // Widgets are mounted: keep them clear of any host overlay (consent banner etc.) that arrived since.
+      adjustProfileWidgetsForOverlay(container);
     };
     profileContainerObserver = new MutationObserver(checkWidgetsStillMounted);
     profileContainerObserver.observe(container, {
@@ -13260,5 +13387,5 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.14.0)");
+  logInfo("Sniffies soft filter loaded (v0.14.1)");
 })();

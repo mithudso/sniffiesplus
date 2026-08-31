@@ -391,7 +391,33 @@ matches current markup).
 4. Returns **`null`** (deliberately not `document.body`) so callers bail rather than injecting into `<body>`
 
 Neither `.his-profile` nor `#sniffies-infowindow` appears in `SNAP` (profile pane closed).
-NOT VERIFIED.
+
+OBSERVED live (2026-08-30, pane open on `/profile/<id>`): both selectors are the **same element** —
+`div#sniffies-infowindow.his-profile` — inside `app-info-window-user`. Its subtree:
+
+```
+div#sniffies-infowindow.his-profile                      static, height 0
+└ div.position-relative (ng-trigger-slideInOutTrigger)   position:fixed, full-viewport; the slide
+  │                                                       animation parks it at left = viewport width
+  │                                                       (`ng-animating`) while opening/closing
+  └ div (ng-trigger-slideInOutTrigger)
+    └ div#app-screen.app-screen                          position:absolute, ~480 px wide pane
+      └ div (ng-trigger-flipChildStateAnimation) → header (back, tier badge, stats line, pin, video)
+                                                     + scrollable content (photos, stats, quote, footer)
+```
+
+Consequences baked into `findProfileContainer()`: every candidate must pass `isRectOnScreen()`, otherwise
+the parked `div.position-relative` wrapper (height > 100, x = viewport width) wins the "first visible
+child" fallback and widgets are injected off-screen; and the height-0 `.his-profile` root is never
+returned. The **NSFW-consent banner** (i18n `NSFW_CONSENT.RECIPROCAL` — "They Can't See Your Full
+Profile" / "Reveal"; siblings `REVEAL`, `VIEW`, `FTUE`) renders **over** the top of the pane content
+(INFERRED absolutely positioned; its markup was not captured), which is exactly where the notes/reminder
+widgets are prepended — `adjustProfileWidgetsForOverlay()` hit-tests the widget and pushes it below any
+host element found there rather than depending on the banner's selector.
+
+While the map is loading, `div.loading-background[data-testid="loading-background-surface"]` (inside
+`.loading-main-content`) covers the whole map; anything `position:fixed` with a high z-index (the
+chat-age badges) paints above it unless hit-tested (`isMarkerSurfaceVisibleAt()`).
 
 Current-profile id: `getCurrentProfileId()` = URL `/profile/<hex6+>` else the first
 `a[href*='/profile/']` anchor's href. `US:8719-8731`. OBSERVED
@@ -738,8 +764,10 @@ Things a library would want that **neither source establishes**:
 10. **Chat-pane, chat-list and message-row selectors.** All heuristic. The snapshot has chat closed,
     so `globalChat-message`, `global-chat-list-container`, `userStats`, `cruiserCard` are only ever
     seen through the userscript's assertions — never verified against markup.
-11. **Profile-pane markup.** `.his-profile` and `#sniffies-infowindow` are unverified; the fallback
-    chain's text heuristics (`"m,"`, `"looking"`) suggest neither reliably matched.
+11. **Profile-pane markup.** `.his-profile` / `#sniffies-infowindow` (one element) and the
+    `position-relative → #app-screen` wrapper chain are now OBSERVED (§5.1); the header/content
+    markup below `#app-screen` and the NSFW-consent banner's own markup are still unverified, so the
+    widgets rely on hit-testing rather than selectors there.
 12. **`vers-bottom` / `side` / `power-bottom` / `dom-top-breeder` icon DOM.** Only `top`, `bottom`
     and the `vers-top` svg modifier appear in `SNAP`. The other buckets' DOM encoding is unconfirmed.
 13. **`onlineStatus` semantics.** The element is empty; whether online/away/offline is a class, a CSS
