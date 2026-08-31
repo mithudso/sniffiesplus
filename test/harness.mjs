@@ -23,7 +23,7 @@ const STATE_HANDLES = [
   "state", "chatActivity", "profileLastActive", "blocked", "tempBlockExpiresAt", "bookmarks", "notes", "appointments",
   "attitudeCache", "idToMarker", "manualAttitudes", "howdySentAt", "iconRules", "profileRatings",
   "profileFilterCache", "profileTextCache", "includeMatches", "selfProfileIds",
-  "chatDeletionStats", "includeDismissed", "profileWidgetOverlayTimers", "profileOverlayDebug",
+  "chatDeletionStats", "includeDismissed",
 ];
 
 // Derive top-level function names directly from the source (2-space indent == direct IIFE child).

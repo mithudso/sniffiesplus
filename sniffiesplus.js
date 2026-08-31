@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.14.2
-// @last-change  2026-08-30 23:45:00 EDT
+// @version      0.15.0
+// @last-change  2026-08-31 00:20:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
 // @match        https://www.sniffies.com/*
@@ -93,9 +93,13 @@ Panels (all openable from the Soft Filter panel's "Panels & windows" section):
     NOTE: hidden by default (showBookmarkPanel starts off) — open it via the
     Bookmarks button if you've never seen it.
   - Appointments: reminder list with approaching/at-time alerts.
-  - Quick Phrases: the phrase menu; auto-anchors beside a chat composer, and can
-    be opened manually from the panel.
-  - Notes modal: per-profile notes editor, opened from a profile's notes widget.
+  - Quick Phrases: the floating profile-tools window. Its top "Profile" section
+    holds the current profile's notes, 5-star rating, Bookmark, Hide this
+    profile and Remind Me (these used to be injected into the profile pane,
+    where Sniffies' own overlays now cover them); the phrase menu sits below.
+    Auto-anchors beside a chat composer, else beside the open profile pane,
+    and can be opened manually from the panel.
+  - Notes modal: per-profile notes editor, opened from the Profile section's ✏️.
 
 Google Drive sync:
   - Disabled by default in public builds.
@@ -856,7 +860,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       left: 10px;
       top: 96px;
       z-index: 100003;
-      width: 210px;
+      width: 290px;
       max-height: 52vh;
       overflow: hidden;
       display: flex;
@@ -910,6 +914,44 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     .sniffies-chat-phrases-panel .sort-select option {
       color: #0f172a;
+    }
+    /* Profile section (notes / rating / bookmark / hide / reminder) — the widgets keep their own
+       .sniffies-profile-* styling; inside the 290px window the notes row wraps: text (+ pencil)
+       on the first line, stars + Bookmark + Hide on the next. */
+    .sniffies-chat-phrases-panel .profile-tools-slot {
+      flex-shrink: 0;
+      padding: 6px 7px 0;
+      border-bottom: 1px solid rgba(255,255,255,.1);
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-tools .cat-head {
+      margin: 0 1px 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-notes {
+      flex-wrap: wrap !important;
+      margin-bottom: 6px !important;
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-notes-text {
+      flex: 1 1 calc(100% - 40px) !important;
+      max-height: 6.5em;
+      overflow: auto;
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-notes-icon {
+      order: 1;
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-rating,
+    .sniffies-chat-phrases-panel .sniffies-profile-bookmark-btn,
+    .sniffies-chat-phrases-panel .sniffies-profile-hide-btn {
+      order: 2;
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-reminder {
+      margin-bottom: 6px !important;
+    }
+    .sniffies-chat-phrases-panel .sniffies-profile-reminder-form input[type="datetime-local"] {
+      min-width: 0;
+      flex: 1 1 100%;
     }
     .sniffies-chat-phrases-panel .list {
       overflow: auto;
@@ -1770,11 +1812,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   let chatCaptureInstalled = false;
   let chatStorageScanNextAt = 0; // deadline timestamp (NOT a timer handle; renamed so no cleanup pass tries clearTimeout on it)
   const autoMessageTabHandles = /* @__PURE__ */ new Map();
-  let profileContainerObserver = null;
   let globalChatHideObserver = null;
-  let profileContainerCheckTimer = 0;
-  // One-shot overlay re-check timers for the current profile widgets (see scheduleProfileWidgetOverlayChecks).
-  let profileWidgetOverlayTimers = [];
   let profileRefreshTimer = 0;
   let bookmarkSaveTimer = 0;
   let broadcastTimer = 0;
@@ -4429,7 +4467,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   function getChatPhraseAnchorRect() {
     if (shouldLog("verbose")) log("→ getChatPhraseAnchorRect", traceArgs(arguments));
     const input = findChatInputElement();
-    if (!input) return null;
+    if (!input) return getProfilePaneAnchorRect();
     const inputRect = input.getBoundingClientRect();
     const viewportArea = Math.max(1, window.innerWidth * window.innerHeight);
     let bestRect = inputRect;
@@ -4465,6 +4503,18 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
       depth += 1;
     }
     return bestRect;
+  }
+  // Anchor for the profile-tools window when no chat composer is open: the visible profile pane
+  // (`#app-screen`, else whatever findProfileContainer() resolves), or null when no pane is on screen.
+  function getProfilePaneAnchorRect() {
+    if (shouldLog("verbose")) log("→ getProfilePaneAnchorRect", traceArgs(arguments));
+    const candidates = [document.querySelector("#app-screen"), findProfileContainer()];
+    for (const el of candidates) {
+      if (!el) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width >= 120 && rect.height >= 120 && isRectOnScreen(rect)) return rect;
+    }
+    return null;
   }
   // Positions the panel just left of the chat anchor, flipping to the right side if there is no room, then clamps within the viewport.
   // Clears right/bottom so left/top take effect.
@@ -4543,6 +4593,7 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
           <button type="button" class="head-btn" id="sfChatPhraseHide">Hide</button>
         </span>
       </div>
+      <div class="profile-tools-slot" id="sfChatProfileTools"></div>
       <div class="list" id="sfChatPhraseList"></div>
     `;
     (_a = panel2.querySelector("#sfChatPhraseSort")) == null ? void 0 : _a.addEventListener("change", (e) => {
@@ -4564,14 +4615,17 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   // Lists Intro then Other phrases; buttons are disabled when no current-chat profile id is resolvable.
   function renderChatPhrasePanel() {
     if (shouldLog("verbose")) log("→ renderChatPhrasePanel", traceArgs(arguments));
-    if (!isChatRoute()) {
+    const profileId = getChatContextProfileId();
+    const onChatRoute = isChatRoute();
+    // The window hosts the profile tools since v0.15.0, so it is also shown on plain /profile/<id>
+    // views (no composer); phrase buttons then just report that a chat must be open.
+    if (!onChatRoute && !profileId) {
       hideChatPhraseContextMenu();
       if (chatPhrasePanelEl) chatPhrasePanelEl.style.display = "none";
       if (chatPhraseLauncherEl) chatPhraseLauncherEl.style.display = "none";
       return;
     }
-    const profileId = getChatContextProfileId();
-    const canSendToCurrentChat = !!profileId;
+    const canSendToCurrentChat = !!profileId && onChatRoute;
     const panel2 = buildChatPhrasePanel();
     const launcher = buildChatPhraseLauncher();
     if (!panel2) return;
@@ -4585,6 +4639,14 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     }
     if (launcher) launcher.style.display = "none";
     panel2.style.display = "flex";
+    panel2.dataset.profileId = profileId || "";
+    const toolsSlot = panel2.querySelector("#sfChatProfileTools");
+    if (toolsSlot) {
+      toolsSlot.textContent = "";
+      const tools = buildProfileToolsSection(profileId);
+      if (tools) toolsSlot.appendChild(tools);
+      toolsSlot.style.display = tools ? "block" : "none";
+    }
     positionChatPhrasePanel(panel2);
     const sortSelect = panel2.querySelector("#sfChatPhraseSort");
     if (sortSelect) sortSelect.value = normalizedQuickPhraseSort(state.quickPhraseSort);
@@ -6829,7 +6891,6 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     for (const t of timers) { try { clearTimeout(t); } catch (e) {} }
     for (const o of observers) { try { o.disconnect(); } catch (e) {} }
     try { if (globalChatHideObserver) globalChatHideObserver.disconnect(); } catch (e) {}
-    try { if (profileContainerObserver) profileContainerObserver.disconnect(); } catch (e) {}
     try { window.removeEventListener("scroll", scheduleChatBadgeRefresh, { capture: true }); } catch (e) {}
     try { window.removeEventListener("resize", scheduleChatBadgeRefresh); } catch (e) {}
     // Stop the broadcast loop (was left opening tabs/queueing messages after teardown).
@@ -6839,7 +6900,6 @@ var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
     try { if (pendingRefreshTimer) { clearTimeout(pendingRefreshTimer); pendingRefreshTimer = 0; } } catch (e) {}
     try { if (chatBadgeRefreshTimer) { clearTimeout(chatBadgeRefreshTimer); chatBadgeRefreshTimer = 0; } } catch (e) {}
     try { if (profileRefreshTimer) { clearTimeout(profileRefreshTimer); profileRefreshTimer = 0; } } catch (e) {}
-    try { clearProfileWidgetOverlayChecks(); } catch (e) {}
     try { if (chatSaveTimer) { clearTimeout(chatSaveTimer); chatSaveTimer = 0; } } catch (e) {}
     try { if (chatDeletionSaveTimer) { clearTimeout(chatDeletionSaveTimer); chatDeletionSaveTimer = 0; } } catch (e) {}
     try { if (bookmarkSaveTimer) { clearTimeout(bookmarkSaveTimer); bookmarkSaveTimer = 0; } } catch (e) {}
@@ -10329,209 +10389,23 @@ ${JSON.stringify(fileContent)}\r
     reminderDisplay.appendChild(form);
     return reminderDisplay;
   }
-  // Insert a widget into a profile container, preferring after a given anchor else as first child.
-  // Wrapped in try/catch with a prepend() fallback; returns whether insertion succeeded.
-  function injectProfileWidget(container, widget, fallbackAfter = null) {
-    if (shouldLog("verbose")) log("→ injectProfileWidget", traceArgs(arguments));
-    if (!container || !widget) return false;
-    try {
-      if (fallbackAfter && fallbackAfter.parentNode === container) {
-        fallbackAfter.insertAdjacentElement("afterend", widget);
-      } else {
-        const firstChild = container.firstChild;
-        if (firstChild) container.insertBefore(widget, firstChild);
-        else container.appendChild(widget);
-      }
-      return true;
-    } catch (e) {
-      try {
-        container.prepend(widget);
-        return true;
-      } catch (e2) {
-        return false;
-      }
-    }
-  }
-  // Sniffies paints absolutely-positioned banners over the top of the profile scroll area — e.g. the
-  // NSFW-consent bar ("They Can't See Your Full Profile" + Reveal). Our widgets are prepended into that
-  // same area, so the banner covers them. Markup-agnostic fix: detect any host box that overlaps the
-  // notes widget at its NATURAL (un-offset) position and push both widgets (notes carries the margin;
-  // reminder follows in flow) below that box's bottom edge. Three independent detectors, because the
-  // banner is a translucent text bar that is very likely `pointer-events: none` (hit-testing sees
-  // straight through it to our own widget):
-  //   1. geometric — any element in the pane whose rect intersects ours, is not ours / an ancestor of
-  //      ours, and sits out of flow (position absolute/fixed/sticky somewhere on its chain up to the
-  //      container); in-flow siblings can never overlap a margin-pushed block, so this is precise;
-  //   2. text — an element whose own text carries the consent-banner titles ("… Full Profile …"),
-  //      whatever its positioning, when it sits within a banner's height of our widget;
-  //   3. hit-test grid — elementFromPoint at 3×2 points across our box (catches overlays that do take
-  //      pointer events, e.g. the Reveal button itself).
-  // The natural position is MEASURED (margin cleared, rect read, margin re-applied in the same task — no
-  // paint in between) rather than derived from the stored offset, so a pass can never accumulate and the
-  // offset drops back to 0 when the banner goes away. Once an offset is applied and the pane has been
-  // scrolled, the pass keeps the current value (a pane-anchored banner would otherwise make the bars jump
-  // on every poll). Costs one forced reflow + one rect read per pane element per pass (5s poll + one-shots).
-  // Returns the applied offset in px; the last pass's evidence is readable via __sniffiesProfileOverlayDebug.
-  const PROFILE_WIDGET_OVERLAY_GAP_PX = 6;
-  const PROFILE_WIDGET_OVERLAY_MAX_PX = 200;
-  const PROFILE_OVERLAY_TEXT_RE = /full profile/i;
-  let profileOverlayDebug = null;
-  function isOutOfFlowChain(el, stopAt) {
-    if (shouldLog("verbose")) log("→ isOutOfFlowChain", traceArgs(arguments));
-    let node = el;
-    while (node && node !== stopAt && node !== document.body) {
-      try {
-        const pos = getComputedStyle(node).position;
-        if (pos === "absolute" || pos === "fixed" || pos === "sticky") return true;
-      } catch (e) {
-        return false;
-      }
-      node = node.parentElement;
-    }
-    return false;
-  }
-  // Climb from an overlay element to its outermost box, stopping at the container / an ancestor of it and
-  // refusing to enter a parent too tall to plausibly be a banner.
-  function overlayRootFor(el, container) {
-    if (shouldLog("verbose")) log("→ overlayRootFor", traceArgs(arguments));
-    let block = el;
-    while (block.parentElement) {
-      const parent = block.parentElement;
-      if (parent === container || parent.contains(container) || parent === document.body) break;
-      if (parent.getBoundingClientRect().height > PROFILE_WIDGET_OVERLAY_MAX_PX) break;
-      block = parent;
-    }
-    return block;
-  }
-  function findScrollableAncestor(el) {
-    if (shouldLog("verbose")) log("→ findScrollableAncestor", traceArgs(arguments));
-    let node = el ? el.parentElement : null;
-    while (node && node !== document.body) {
-      try {
-        const ov = getComputedStyle(node).overflowY;
-        if ((ov === "auto" || ov === "scroll") && node.scrollHeight > node.clientHeight) return node;
-      } catch (e) {
-        return null;
-      }
-      node = node.parentElement;
-    }
-    return null;
-  }
-  function adjustProfileWidgetsForOverlay(container) {
-    if (shouldLog("verbose")) log("→ adjustProfileWidgetsForOverlay", traceArgs(arguments));
-    if (!container || typeof container.querySelector !== "function") return 0;
-    const notes = container.querySelector(".sniffies-profile-notes");
-    if (!notes || !document.body.contains(notes)) return 0;
-    const reminder = container.querySelector(".sniffies-profile-reminder");
-    const current = parseFloat(notes.dataset.overlayOffset || "0") || 0;
-    const restore = () => {
-      notes.style.marginTop = current ? `${current}px` : "";
-    };
-    const scroller = findScrollableAncestor(notes);
-    if (current && scroller && scroller.scrollTop > 0) return current;
-    notes.style.marginTop = "";
-    const rect = notes.getBoundingClientRect();
-    if (rect.width < 20 || rect.height < 4) {
-      restore();
-      return current;
-    }
-    const naturalTop = rect.top;
-    const isOurs = (el) => notes.contains(el) || (reminder && reminder.contains(el)) || (typeof el.closest === "function" && !!el.closest(".sniffies-profile-notes, .sniffies-profile-reminder"));
-    const evidence = [];
-    let overlayBottom = -Infinity;
-    const consider = (el, how) => {
-      if (!el || el === container || el.contains(container) || isOurs(el)) return;
-      const block = overlayRootFor(el, container);
-      const b = block.getBoundingClientRect();
-      if (b.height <= 0 || b.width <= 0) return;
-      overlayBottom = Math.max(overlayBottom, b.bottom);
-      if (evidence.length < 8) evidence.push({ how, tag: el.tagName, cls: String(el.className || "").slice(0, 60), bottom: Math.round(b.bottom) });
-    };
-    // 1 + 2: walk the pane once. The pane is the nearest known pane root, else the container itself.
-    const pane = (typeof container.closest === "function" && container.closest("#app-screen, .his-profile, #sniffies-infowindow")) || container;
-    const intersects = (r) => r.width > 0 && r.height > 0 && r.left < rect.right && r.right > rect.left && r.top < rect.bottom && r.bottom > rect.top;
-    const near = (r) => r.width > 0 && r.height > 0 && r.left < rect.right && r.right > rect.left && r.top < rect.bottom + PROFILE_WIDGET_OVERLAY_MAX_PX && r.bottom > rect.top - PROFILE_WIDGET_OVERLAY_MAX_PX;
-    let scanned = 0;
-    try {
-      for (const el of pane.querySelectorAll("*")) {
-        scanned += 1;
-        if (isOurs(el) || el === container || el.contains(notes)) continue;
-        const r = el.getBoundingClientRect();
-        if (r.height > PROFILE_WIDGET_OVERLAY_MAX_PX) continue;
-        if (intersects(r)) {
-          const stopAt = container.contains(el) ? container : pane;
-          if (isOutOfFlowChain(el, stopAt)) {
-            consider(el, "geometry");
-            continue;
-          }
-        }
-        if (near(r)) {
-          let ownText = "";
-          for (const n of el.childNodes) if (n.nodeType === 3) ownText += n.textContent;
-          if (PROFILE_OVERLAY_TEXT_RE.test(ownText)) consider(el, "text");
-        }
-      }
-    } catch (e) {
-    }
-    // 3: hit-test grid (only meaningful when the box is inside the viewport).
-    if (rect.right > 0 && rect.left < window.innerWidth) {
-      for (const fy of [0.3, 0.75]) {
-        const y = naturalTop + rect.height * fy;
-        if (y < 0 || y >= window.innerHeight) continue;
-        for (const fx of [0.2, 0.55, 0.9]) {
-          const x = rect.left + rect.width * fx;
-          if (x < 0 || x >= window.innerWidth) continue;
-          let hit = null;
-          try {
-            hit = document.elementFromPoint(x, y);
-          } catch (e) {
-            hit = null;
-          }
-          // Empty space inside a transparent container hit-tests to the container (or an ancestor): not an overlay.
-          if (hit) consider(hit, "hit");
-        }
-      }
-    }
-    let next = 0;
-    if (Number.isFinite(overlayBottom)) {
-      next = Math.max(0, Math.min(PROFILE_WIDGET_OVERLAY_MAX_PX, Math.round(overlayBottom + PROFILE_WIDGET_OVERLAY_GAP_PX - naturalTop)));
-    }
-    notes.style.marginTop = next ? `${next}px` : "";
-    notes.dataset.overlayOffset = String(next);
-    profileOverlayDebug = { at: now(), naturalTop: Math.round(naturalTop), overlayBottom: Number.isFinite(overlayBottom) ? Math.round(overlayBottom) : null, offset: next, scanned, pane: pane.id || pane.className, evidence };
-    return next;
-  }
-  // The consent banner mounts asynchronously after the pane; re-check a few times after injection.
-  // Previous one-shots are cancelled first (a re-render replaces the widgets), and teardownSniffies()
-  // clears whatever is still pending.
-  function scheduleProfileWidgetOverlayChecks(container) {
-    if (shouldLog("verbose")) log("→ scheduleProfileWidgetOverlayChecks", traceArgs(arguments));
-    clearProfileWidgetOverlayChecks();
-    if (!container) return;
-    for (const delay of [0, 250, 900, 2200]) {
-      profileWidgetOverlayTimers.push(setTimeout(() => {
-        if (!document.body.contains(container)) return;
-        adjustProfileWidgetsForOverlay(container);
-      }, delay));
-    }
-  }
-  function clearProfileWidgetOverlayChecks() {
-    if (shouldLog("verbose")) log("→ clearProfileWidgetOverlayChecks", traceArgs(arguments));
-    for (const t of profileWidgetOverlayTimers.splice(0)) {
-      try { clearTimeout(t); } catch (e) {}
-    }
-  }
-  // Rebuild the injected notes panel for a profile: note text, 5-star rating, bookmark/hide buttons, edit pencil.
-  // Removes stale panels first, then injects notes + reminder widgets and starts the container observer.
+  // Re-render the profile tools for a profile. The tools (notes, rating, bookmark, hide, reminder) live in
+  // the Profile section of the Quick Phrases window since v0.15.0 — they were injected into the profile
+  // pane before, where Sniffies' own overlays (NSFW-consent banner) now cover them. Kept as the single
+  // "something about this profile changed" entry point: the notes modal, star clicks and reminder save
+  // all call it, and observeProfileChanges() schedules it on route changes.
   function updateProfileNotesDisplay(profileId) {
     if (shouldLog("verbose")) log("→ updateProfileNotesDisplay", traceArgs(arguments));
-    var _a, _b;
     const normalizedProfileId = normalizeProfileId(profileId);
     if (!normalizedProfileId) return;
-    const container = findProfileContainer();
-    if (!container) return;
-    (_a = container.querySelector(".sniffies-profile-notes")) == null ? void 0 : _a.remove();
-    (_b = container.querySelector(".sniffies-profile-reminder")) == null ? void 0 : _b.remove();
+    renderChatPhrasePanel();
+  }
+  // Build the notes widget for a profile: note text, 5-star rating, bookmark/hide buttons, edit pencil.
+  // `container` (the profile pane, may be null) is only used to derive the bookmark label/url.
+  function buildProfileNotesDisplay(profileId, container) {
+    if (shouldLog("verbose")) log("→ buildProfileNotesDisplay", traceArgs(arguments));
+    const normalizedProfileId = normalizeProfileId(profileId);
+    if (!normalizedProfileId) return null;
     const noteValue = String(notes[normalizedProfileId] || "");
     const hasNote = !!noteValue.trim();
     const hasReminder = !!getNextAppointmentForProfile(normalizedProfileId);
@@ -10616,54 +10490,37 @@ ${JSON.stringify(fileContent)}\r
     notesDisplay.style.borderRadius = "6px";
     notesDisplay.style.position = "relative";
     notesDisplay.style.zIndex = "1000";
-    const reminderDisplay = buildProfileReminderDisplay(normalizedProfileId, container, { compactEmpty });
-    injectProfileWidget(container, notesDisplay);
-    injectProfileWidget(container, reminderDisplay, notesDisplay);
-    observeContainerForChanges(normalizedProfileId, container);
-    scheduleProfileWidgetOverlayChecks(container);
+    return notesDisplay;
   }
-  // Watch a profile container and re-inject widgets if the notes/reminder nodes get removed.
-  // Uses a single-child MutationObserver plus a 1500ms interval; resets any prior observer/timer.
-  function observeContainerForChanges(profileId, container) {
-    if (shouldLog("verbose")) log("→ observeContainerForChanges", traceArgs(arguments));
-    if (!container) return;
-    if (profileContainerObserver) {
-      profileContainerObserver.disconnect();
-      profileContainerObserver = null;
-    }
-    if (profileContainerCheckTimer) {
-      clearInterval(profileContainerCheckTimer);
-      profileContainerCheckTimer = 0;
-    }
-    // One shared check used by both the observer (primary) and the interval (safety net for
-    // mutations the childList filter misses); previously two byte-identical inline bodies.
-    const checkWidgetsStillMounted = () => {
-      if (!document.body.contains(container)) return;
-      const notesStillThere = container.querySelector(".sniffies-profile-notes");
-      const reminderStillThere = container.querySelector(".sniffies-profile-reminder");
-      if (!notesStillThere || !reminderStillThere) {
-        scheduleProfileDisplayRefresh(profileId, 120);
-        return;
-      }
-      // Widgets are mounted: keep them clear of any host overlay (consent banner etc.) that arrived since.
-      adjustProfileWidgetsForOverlay(container);
-    };
-    profileContainerObserver = new MutationObserver(checkWidgetsStillMounted);
-    profileContainerObserver.observe(container, {
-      childList: true,
-      subtree: false
-    });
-    // Safety-net poll, lengthened from 1.5s (the observer covers childList on the same node);
-    // registered in bootTimers so teardownSniffies() stops it.
-    profileContainerCheckTimer = setInterval(checkWidgetsStillMounted, 5e3);
-    bootTimers.push(profileContainerCheckTimer);
+  // Build the Profile section body (notes widget + reminder widget) for the Quick Phrases window, or null
+  // when no profile is in context. Empty note + no reminder renders the compact variant of both widgets.
+  function buildProfileToolsSection(profileId) {
+    if (shouldLog("verbose")) log("→ buildProfileToolsSection", traceArgs(arguments));
+    const normalizedProfileId = normalizeProfileId(profileId);
+    if (!normalizedProfileId) return null;
+    const container = findProfileContainer();
+    const hasNote = !!String(notes[normalizedProfileId] || "").trim();
+    const hasReminder = !!getNextAppointmentForProfile(normalizedProfileId);
+    const compactEmpty = !hasNote && !hasReminder;
+    const wrap = document.createElement("div");
+    wrap.className = "sniffies-profile-tools";
+    wrap.dataset.profileId = normalizedProfileId;
+    const head = document.createElement("div");
+    head.className = "cat-head";
+    const label = getProfileLabelFromContainer(normalizedProfileId, container);
+    head.textContent = /^Profile\b/.test(label) ? label : `Profile \xB7 ${label}`;
+    head.title = normalizedProfileId;
+    wrap.appendChild(head);
+    const notesDisplay = buildProfileNotesDisplay(normalizedProfileId, container);
+    if (notesDisplay) wrap.appendChild(notesDisplay);
+    wrap.appendChild(buildProfileReminderDisplay(normalizedProfileId, container, { compactEmpty }));
+    return wrap;
   }
   // Global observer: detect profile/container changes on the SPA and schedule a display refresh.
   // Body MutationObserver (href/data-testid only — see attributeFilter below) + 1500ms poll; also kicks an initial refresh.
   function observeProfileChanges() {
     if (shouldLog("verbose")) log("→ observeProfileChanges", traceArgs(arguments));
     let lastProfileId = null;
-    let lastContainer = null;
     logInfo("Starting profile observer");
     // Debounced: on an Angular+MapLibre page this body-wide observer fires constantly, and its body
     // runs the reflow-heavy findProfileContainer() heuristic. Mutation bursts coalesce into one
@@ -10672,14 +10529,10 @@ ${JSON.stringify(fileContent)}\r
     const runProfileCheck = () => {
       profileCheckPending = 0;
       const profileId = normalizeProfileId(getCurrentProfileId());
-      if (!profileId) return;
-      const container = findProfileContainer();
-      if (!container) return;
-      if (profileId !== lastProfileId || container !== lastContainer) {
-        lastProfileId = profileId;
-        lastContainer = container;
-        scheduleProfileDisplayRefresh(profileId, 220);
-      }
+      if (profileId === lastProfileId) return;
+      lastProfileId = profileId;
+      if (profileId) scheduleProfileDisplayRefresh(profileId, 220);
+      else refreshChatPhrasePanelMaybe();
     };
     const observer = new MutationObserver(() => {
       if (profileCheckPending) return;
@@ -10699,16 +10552,11 @@ ${JSON.stringify(fileContent)}\r
     // too (every other boot interval is tracked; this one was previously orphaned).
     bootTimers.push(setInterval(() => {
       const profileId = normalizeProfileId(getCurrentProfileId());
-      if (!profileId) return;
-      const container = findProfileContainer();
-      if (!container) return;
-      const notesVisible = container.querySelector(".sniffies-profile-notes");
-      const reminderVisible = container.querySelector(".sniffies-profile-reminder");
-      if (profileId !== lastProfileId || container !== lastContainer || !notesVisible || !reminderVisible) {
-        lastProfileId = profileId;
-        lastContainer = container;
-        scheduleProfileDisplayRefresh(profileId, 140);
-      }
+      const shown = chatPhrasePanelEl && chatPhrasePanelEl.style.display !== "none" ? chatPhrasePanelEl.dataset.profileId || null : null;
+      if (profileId === lastProfileId && (!profileId || shown === profileId || !state.showChatPhrasePanel)) return;
+      lastProfileId = profileId;
+      if (profileId) scheduleProfileDisplayRefresh(profileId, 140);
+      else refreshChatPhrasePanelMaybe();
     }, 1500));
     const initialId = normalizeProfileId(getCurrentProfileId());
     logInfo("Initial profile ID check:", initialId);
@@ -13443,7 +13291,6 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesForcePartialsFetch", sniffiesForcePartialsFetch, { sandboxOnly: true });
   exposeGlobal("__sniffiesExtractAttitude", sniffiesExtractAttitude);
   exposeGlobal("__sniffiesChatAgeStats", sniffiesChatAgeStats, { sandboxOnly: true });
-  exposeGlobal("__sniffiesProfileOverlayDebug", () => profileOverlayDebug);
   exposeGlobal("__sniffiesSetSelfId", sniffiesSetSelfId, { sandboxOnly: true });
   exposeGlobal("__sniffiesForceChatRefresh", sniffiesForceChatRefresh, { sandboxOnly: true });
   exposeGlobal("__sniffiesRescanChatAges", sniffiesRescanChatAges, { sandboxOnly: true });
@@ -13472,5 +13319,5 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.14.2)");
+  logInfo("Sniffies soft filter loaded (v0.15.0)");
 })();

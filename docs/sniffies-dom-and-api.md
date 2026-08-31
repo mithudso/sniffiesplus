@@ -408,12 +408,15 @@ div#sniffies-infowindow.his-profile                      static, height 0
 
 Consequences baked into `findProfileContainer()`: every candidate must pass `isRectOnScreen()`, otherwise
 the parked `div.position-relative` wrapper (height > 100, x = viewport width) wins the "first visible
-child" fallback and widgets are injected off-screen; and the height-0 `.his-profile` root is never
-returned. The **NSFW-consent banner** (i18n `NSFW_CONSENT.RECIPROCAL` — "They Can't See Your Full
-Profile" / "Reveal"; siblings `REVEAL`, `VIEW`, `FTUE`) renders **over** the top of the pane content
-(INFERRED absolutely positioned; its markup was not captured), which is exactly where the notes/reminder
-widgets are prepended — `adjustProfileWidgetsForOverlay()` hit-tests the widget and pushes it below any
-host element found there rather than depending on the banner's selector.
+child" fallback; the height-0 `.his-profile` root is never returned. The **NSFW-consent banner** (i18n
+`NSFW_CONSENT.RECIPROCAL` — "They Can't See Your Full Profile" / "Reveal"; siblings `REVEAL`, `VIEW`,
+`FTUE`) renders **over** the top of the pane content (INFERRED absolutely positioned and
+`pointer-events: none` — a v0.14.x `elementFromPoint` detector never saw it; its markup was not captured).
+Since v0.15.0 the userscript therefore injects **nothing** into the pane: the notes / rating / bookmark /
+hide / reminder tools live in the Quick Phrases window (`buildProfileToolsSection()`), which is shown on
+any `/profile/<id>` route and anchored beside `#app-screen` when no chat composer exists
+(`getProfilePaneAnchorRect()`). `findProfileContainer()` is now only used to derive the bookmark
+label/url and the pane anchor.
 
 While the map is loading, `div.loading-background[data-testid="loading-background-surface"]` (inside
 `.loading-main-content`) covers the whole map; anything `position:fixed` with a high z-index (the
@@ -766,8 +769,8 @@ Things a library would want that **neither source establishes**:
     seen through the userscript's assertions — never verified against markup.
 11. **Profile-pane markup.** `.his-profile` / `#sniffies-infowindow` (one element) and the
     `position-relative → #app-screen` wrapper chain are now OBSERVED (§5.1); the header/content
-    markup below `#app-screen` and the NSFW-consent banner's own markup are still unverified, so the
-    widgets rely on hit-testing rather than selectors there.
+    markup below `#app-screen` and the NSFW-consent banner's own markup are still unverified — which is
+    why v0.15.0 stopped injecting widgets into the pane altogether (they live in the Quick Phrases window).
 12. **`vers-bottom` / `side` / `power-bottom` / `dom-top-breeder` icon DOM.** Only `top`, `bottom`
     and the `vers-top` svg modifier appear in `SNAP`. The other buckets' DOM encoding is unconfirmed.
 13. **`onlineStatus` semantics.** The element is empty; whether online/away/offline is a class, a CSS
