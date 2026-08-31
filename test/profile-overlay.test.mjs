@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { getInternals } from "./harness.mjs";
 
 const S = getInternals();
-// Feature gate: overlay-aware profile widgets + occluded-badge hiding shipped in v0.14.1.
+// Feature gate: overlay-aware profile widgets + occluded-badge hiding shipped in v0.14.1 (geometry/text detectors v0.14.2).
 const HAS_OVERLAY = typeof S.adjustProfileWidgetsForOverlay === "function";
 const describeIf = describe.skipIf(!HAS_OVERLAY);
 
@@ -96,7 +96,7 @@ describeIf("adjustProfileWidgetsForOverlay (notes/reminder bars vs host banner)"
   });
 
   it("pushes the notes bar below an overlay that hit-tests on top of it, climbing to the overlay's outer box", () => {
-    document.elementFromPoint = () => bannerInner;
+    document.elementFromPoint = () => bannerInner; // banner still in flow: only the hit-test detector fires
     const offset = S.adjustProfileWidgetsForOverlay(container);
     // banner.bottom (140) + 6px gap - natural top (100)
     expect(offset).toBe(46);
@@ -145,11 +145,65 @@ describeIf("adjustProfileWidgetsForOverlay (notes/reminder bars vs host banner)"
     expect(S.adjustProfileWidgetsForOverlay(container)).toBe(200);
     expect(S.adjustProfileWidgetsForOverlay(document.createElement("div"))).toBe(0);
     expect(S.adjustProfileWidgetsForOverlay(null)).toBe(0);
+    // Off-screen natural position: hit-testing is skipped but geometry still decides (here: nothing overlaps).
+    setRect(banner, { left: 0, top: -504, width: 480, height: 44 });
+    setRect(bannerInner, { left: 400, top: -496, width: 60, height: 28 });
     setFlowRect(notes, { left: 0, top: -500, width: 480, height: 30 });
     notes.style.marginTop = "12px";
     notes.dataset.overlayOffset = "12";
-    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(12);
-    expect(notes.style.marginTop).toBe("12px");
+    document.elementFromPoint = () => { throw new Error("must not be called off-screen"); };
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(0);
+    banner.style.position = "absolute";
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(46);
+  });
+
+  it("geometry: detects a pointer-events:none banner that hit-testing sees straight through", () => {
+    document.elementFromPoint = () => notes; // banner is transparent to the pointer
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(0);
+    banner.style.position = "absolute";
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(46);
+    expect(S.__state.profileOverlayDebug.evidence[0].how).toBe("geometry");
+    // An in-flow element with an intersecting stub rect is NOT an overlay (in-flow boxes can't overlap us).
+    banner.style.position = "";
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(0);
+  });
+
+  it("geometry: also finds a banner that is a sibling of the container inside the pane root", () => {
+    const pane = document.createElement("div");
+    pane.id = "app-screen";
+    document.body.appendChild(pane);
+    pane.appendChild(container);
+    pane.appendChild(banner);
+    banner.style.position = "absolute";
+    document.elementFromPoint = () => notes;
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(46);
+  });
+
+  it("text fallback: an element whose own text names the consent banner counts even when in flow", () => {
+    document.elementFromPoint = () => notes;
+    const title = document.createElement("span");
+    title.textContent = "They Can't See Your Full Profile";
+    banner.appendChild(title);
+    setRect(title, { left: 80, top: 108, width: 200, height: 20 });
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(46);
+    expect(S.__state.profileOverlayDebug.evidence.some((e) => e.how === "text")).toBe(true);
+  });
+
+  it("keeps an applied offset while the pane is scrolled (no jumping on every poll)", () => {
+    banner.style.position = "absolute";
+    document.elementFromPoint = () => notes;
+    const scroller = document.createElement("div");
+    scroller.style.overflowY = "auto";
+    document.body.appendChild(scroller);
+    scroller.appendChild(container);
+    Object.defineProperty(scroller, "scrollHeight", { value: 2000 });
+    Object.defineProperty(scroller, "clientHeight", { value: 600 });
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(46);
+    scroller.scrollTop = 120;
+    banner.remove(); // banner gone, but we are scrolled: hold the value
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(46);
+    scroller.scrollTop = 0;
+    expect(S.adjustProfileWidgetsForOverlay(container)).toBe(0);
   });
 
   it("scheduleProfileWidgetOverlayChecks re-runs the adjustment on a timer and cancels prior one-shots", () => {

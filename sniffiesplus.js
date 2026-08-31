@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sniffies Soft Filter (Bottom / Vers Bottom)
 // @namespace    https://sniffies.com/
-// @version      0.14.1
-// @last-change  2026-08-30 23:30:00 EDT
+// @version      0.14.2
+// @last-change  2026-08-30 23:45:00 EDT
 // @description  Soft-hide selected attitudes, profile text filters, chat-age badges, 24h/2h chat filters, a not-online-in-2h filter, auto-hide of repeat message-deleters and of profiles you've sent 4+ messages with no reply (until they reply), auto-unhide of manually-hidden profiles on reply, Global-Chat filtering of blocked profiles' messages (middle-click a Global Chat message to hide/block its author), top-bar attitude + Global-Chat quick-toggle buttons, profile reminders, and memory cleanup.
 // @match        https://sniffies.com/*
 // @match        https://www.sniffies.com/*
@@ -10354,15 +10354,69 @@ ${JSON.stringify(fileContent)}\r
   }
   // Sniffies paints absolutely-positioned banners over the top of the profile scroll area — e.g. the
   // NSFW-consent bar ("They Can't See Your Full Profile" + Reveal). Our widgets are prepended into that
-  // same area, so the banner covers them. Markup-agnostic fix: hit-test the notes widget at its NATURAL
-  // (un-offset) position; if the topmost element there belongs to the host page, push both widgets
-  // (notes carries the margin; reminder follows in flow) below that overlay's bottom edge. The natural
-  // position is MEASURED (margin cleared, rect read, margin re-applied in the same task — no paint in
-  // between) rather than derived from the stored offset, so a pass can never accumulate and the offset
-  // drops back to 0 when the banner goes away. Costs one forced reflow per pass (5s poll + 4 one-shots).
-  // Returns the applied offset in px.
+  // same area, so the banner covers them. Markup-agnostic fix: detect any host box that overlaps the
+  // notes widget at its NATURAL (un-offset) position and push both widgets (notes carries the margin;
+  // reminder follows in flow) below that box's bottom edge. Three independent detectors, because the
+  // banner is a translucent text bar that is very likely `pointer-events: none` (hit-testing sees
+  // straight through it to our own widget):
+  //   1. geometric — any element in the pane whose rect intersects ours, is not ours / an ancestor of
+  //      ours, and sits out of flow (position absolute/fixed/sticky somewhere on its chain up to the
+  //      container); in-flow siblings can never overlap a margin-pushed block, so this is precise;
+  //   2. text — an element whose own text carries the consent-banner titles ("… Full Profile …"),
+  //      whatever its positioning, when it sits within a banner's height of our widget;
+  //   3. hit-test grid — elementFromPoint at 3×2 points across our box (catches overlays that do take
+  //      pointer events, e.g. the Reveal button itself).
+  // The natural position is MEASURED (margin cleared, rect read, margin re-applied in the same task — no
+  // paint in between) rather than derived from the stored offset, so a pass can never accumulate and the
+  // offset drops back to 0 when the banner goes away. Once an offset is applied and the pane has been
+  // scrolled, the pass keeps the current value (a pane-anchored banner would otherwise make the bars jump
+  // on every poll). Costs one forced reflow + one rect read per pane element per pass (5s poll + one-shots).
+  // Returns the applied offset in px; the last pass's evidence is readable via __sniffiesProfileOverlayDebug.
   const PROFILE_WIDGET_OVERLAY_GAP_PX = 6;
   const PROFILE_WIDGET_OVERLAY_MAX_PX = 200;
+  const PROFILE_OVERLAY_TEXT_RE = /full profile/i;
+  let profileOverlayDebug = null;
+  function isOutOfFlowChain(el, stopAt) {
+    if (shouldLog("verbose")) log("→ isOutOfFlowChain", traceArgs(arguments));
+    let node = el;
+    while (node && node !== stopAt && node !== document.body) {
+      try {
+        const pos = getComputedStyle(node).position;
+        if (pos === "absolute" || pos === "fixed" || pos === "sticky") return true;
+      } catch (e) {
+        return false;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+  // Climb from an overlay element to its outermost box, stopping at the container / an ancestor of it and
+  // refusing to enter a parent too tall to plausibly be a banner.
+  function overlayRootFor(el, container) {
+    if (shouldLog("verbose")) log("→ overlayRootFor", traceArgs(arguments));
+    let block = el;
+    while (block.parentElement) {
+      const parent = block.parentElement;
+      if (parent === container || parent.contains(container) || parent === document.body) break;
+      if (parent.getBoundingClientRect().height > PROFILE_WIDGET_OVERLAY_MAX_PX) break;
+      block = parent;
+    }
+    return block;
+  }
+  function findScrollableAncestor(el) {
+    if (shouldLog("verbose")) log("→ findScrollableAncestor", traceArgs(arguments));
+    let node = el ? el.parentElement : null;
+    while (node && node !== document.body) {
+      try {
+        const ov = getComputedStyle(node).overflowY;
+        if ((ov === "auto" || ov === "scroll") && node.scrollHeight > node.clientHeight) return node;
+      } catch (e) {
+        return null;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
   function adjustProfileWidgetsForOverlay(container) {
     if (shouldLog("verbose")) log("→ adjustProfileWidgetsForOverlay", traceArgs(arguments));
     if (!container || typeof container.querySelector !== "function") return 0;
@@ -10373,6 +10427,8 @@ ${JSON.stringify(fileContent)}\r
     const restore = () => {
       notes.style.marginTop = current ? `${current}px` : "";
     };
+    const scroller = findScrollableAncestor(notes);
+    if (current && scroller && scroller.scrollTop > 0) return current;
     notes.style.marginTop = "";
     const rect = notes.getBoundingClientRect();
     if (rect.width < 20 || rect.height < 4) {
@@ -10380,34 +10436,61 @@ ${JSON.stringify(fileContent)}\r
       return current;
     }
     const naturalTop = rect.top;
-    const y = naturalTop + rect.height / 2;
-    if (y < 0 || y >= window.innerHeight || rect.right <= 0 || rect.left >= window.innerWidth) {
-      restore();
-      return current;
-    }
     const isOurs = (el) => notes.contains(el) || (reminder && reminder.contains(el)) || (typeof el.closest === "function" && !!el.closest(".sniffies-profile-notes, .sniffies-profile-reminder"));
+    const evidence = [];
     let overlayBottom = -Infinity;
-    for (const frac of [0.2, 0.5, 0.85]) {
-      const x = rect.left + rect.width * frac;
-      if (x < 0 || x >= window.innerWidth) continue;
-      let hit = null;
-      try {
-        hit = document.elementFromPoint(x, y);
-      } catch (e) {
-        hit = null;
+    const consider = (el, how) => {
+      if (!el || el === container || el.contains(container) || isOurs(el)) return;
+      const block = overlayRootFor(el, container);
+      const b = block.getBoundingClientRect();
+      if (b.height <= 0 || b.width <= 0) return;
+      overlayBottom = Math.max(overlayBottom, b.bottom);
+      if (evidence.length < 8) evidence.push({ how, tag: el.tagName, cls: String(el.className || "").slice(0, 60), bottom: Math.round(b.bottom) });
+    };
+    // 1 + 2: walk the pane once. The pane is the nearest known pane root, else the container itself.
+    const pane = (typeof container.closest === "function" && container.closest("#app-screen, .his-profile, #sniffies-infowindow")) || container;
+    const intersects = (r) => r.width > 0 && r.height > 0 && r.left < rect.right && r.right > rect.left && r.top < rect.bottom && r.bottom > rect.top;
+    const near = (r) => r.width > 0 && r.height > 0 && r.left < rect.right && r.right > rect.left && r.top < rect.bottom + PROFILE_WIDGET_OVERLAY_MAX_PX && r.bottom > rect.top - PROFILE_WIDGET_OVERLAY_MAX_PX;
+    let scanned = 0;
+    try {
+      for (const el of pane.querySelectorAll("*")) {
+        scanned += 1;
+        if (isOurs(el) || el === container || el.contains(notes)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.height > PROFILE_WIDGET_OVERLAY_MAX_PX) continue;
+        if (intersects(r)) {
+          const stopAt = container.contains(el) ? container : pane;
+          if (isOutOfFlowChain(el, stopAt)) {
+            consider(el, "geometry");
+            continue;
+          }
+        }
+        if (near(r)) {
+          let ownText = "";
+          for (const n of el.childNodes) if (n.nodeType === 3) ownText += n.textContent;
+          if (PROFILE_OVERLAY_TEXT_RE.test(ownText)) consider(el, "text");
+        }
       }
-      // Empty space inside a transparent container hit-tests to the container (or an ancestor): not an overlay.
-      if (!hit || hit === container || hit.contains(container) || isOurs(hit)) continue;
-      // Climb to the overlay's outermost box, stopping at the container / an ancestor of it, at the
-      // notes widget's own subtree, or when the parent is too tall to plausibly be a banner.
-      let block = hit;
-      while (block.parentElement) {
-        const parent = block.parentElement;
-        if (parent === container || parent.contains(container) || parent === document.body) break;
-        if (parent.getBoundingClientRect().height > PROFILE_WIDGET_OVERLAY_MAX_PX) break;
-        block = parent;
+    } catch (e) {
+    }
+    // 3: hit-test grid (only meaningful when the box is inside the viewport).
+    if (rect.right > 0 && rect.left < window.innerWidth) {
+      for (const fy of [0.3, 0.75]) {
+        const y = naturalTop + rect.height * fy;
+        if (y < 0 || y >= window.innerHeight) continue;
+        for (const fx of [0.2, 0.55, 0.9]) {
+          const x = rect.left + rect.width * fx;
+          if (x < 0 || x >= window.innerWidth) continue;
+          let hit = null;
+          try {
+            hit = document.elementFromPoint(x, y);
+          } catch (e) {
+            hit = null;
+          }
+          // Empty space inside a transparent container hit-tests to the container (or an ancestor): not an overlay.
+          if (hit) consider(hit, "hit");
+        }
       }
-      overlayBottom = Math.max(overlayBottom, block.getBoundingClientRect().bottom);
     }
     let next = 0;
     if (Number.isFinite(overlayBottom)) {
@@ -10415,6 +10498,7 @@ ${JSON.stringify(fileContent)}\r
     }
     notes.style.marginTop = next ? `${next}px` : "";
     notes.dataset.overlayOffset = String(next);
+    profileOverlayDebug = { at: now(), naturalTop: Math.round(naturalTop), overlayBottom: Number.isFinite(overlayBottom) ? Math.round(overlayBottom) : null, offset: next, scanned, pane: pane.id || pane.className, evidence };
     return next;
   }
   // The consent banner mounts asynchronously after the pane; re-check a few times after injection.
@@ -13359,6 +13443,7 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesForcePartialsFetch", sniffiesForcePartialsFetch, { sandboxOnly: true });
   exposeGlobal("__sniffiesExtractAttitude", sniffiesExtractAttitude);
   exposeGlobal("__sniffiesChatAgeStats", sniffiesChatAgeStats, { sandboxOnly: true });
+  exposeGlobal("__sniffiesProfileOverlayDebug", () => profileOverlayDebug);
   exposeGlobal("__sniffiesSetSelfId", sniffiesSetSelfId, { sandboxOnly: true });
   exposeGlobal("__sniffiesForceChatRefresh", sniffiesForceChatRefresh, { sandboxOnly: true });
   exposeGlobal("__sniffiesRescanChatAges", sniffiesRescanChatAges, { sandboxOnly: true });
@@ -13387,5 +13472,5 @@ Examples: ${names.join(", ")}${filtered.length > 3 ? ", ..." : ""}` : "";
   exposeGlobal("__sniffiesQuickPhrases", sniffiesQuickPhrases, { sandboxOnly: true });
   exposeGlobal("__sniffiesAddQuickPhrase", sniffiesAddQuickPhrase, { sandboxOnly: true });
   // Final boot log; version string is one of the 4 places to update when bumping the version.
-  logInfo("Sniffies soft filter loaded (v0.14.1)");
+  logInfo("Sniffies soft filter loaded (v0.14.2)");
 })();
